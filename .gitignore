@@ -1,0 +1,27 @@
+# build outputs
+/build*/
+*.o
+*.a
+
+# Dear ImGui is provided by the user (cloned separately, see README)
+/imgui/
+/imgui_docking/
+
+# reference material present locally, not part of this project
+/implot3d/
+/juce_organicui/
+
+# runtime / user files generated next to the executable
+/assets/
+/layouts/
+organic_imgui.ini
+organic_app.json
+autosave.organic.json
+*.organic.json
+imgui.ini
+
+# editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
