@@ -154,14 +154,32 @@ public:
     virtual std::string inspectableLabel()    const { return "Object"; }
     virtual void        inspectorGui() {}
 
-    bool isSelected() const;
-    void select(bool addToSelection = false);
+    bool isSelected() const;     // selected in any selection scope
+    bool isPreselected() const;  // inside a rubber band that is still being dragged
+    bool isHighlighted() const;  // a linked inspectable is selected
+    void select(bool addToSelection = false); // selects in the main scope
+
+    std::vector<Inspectable*> linkedInspectables; // managed via linkInspectables()
 };
 
+// Link two inspectables: selecting one highlights the other (organicui's
+// linked inspectables). Links are removed automatically on destruction.
+void linkInspectables(Inspectable* a, Inspectable* b);
+void unlinkInspectables(Inspectable* a, Inspectable* b);
+
+// A selection scope. organicui has several selection managers (main + per
+// panel); here: Selection::get() is the main scope, Selection::scope("name")
+// creates/returns named scopes, Selection::active() is the scope that last
+// changed (the Inspector follows it).
 class Selection
 {
 public:
-    static Selection& get();
+    static Selection& get();                        // main scope
+    static Selection& scope(const std::string& n);  // named scope registry
+    static Selection* active();                     // last scope that changed
+    static std::vector<Selection*>& allScopes();
+
+    std::string name = "main";
 
     void set(Inspectable* i);
     void add(Inspectable* i);
@@ -169,6 +187,12 @@ public:
     void remove(Inspectable* i);
     void clear();
     bool contains(const Inspectable* i) const;
+
+    // preselection (rubber band in progress)
+    void setPreselection(const std::vector<Inspectable*>& items);
+    void clearPreselection();
+    void commitPreselection(); // preselected -> selected (added)
+    bool preselContains(const Inspectable* i) const;
 
     template <typename T> std::vector<T*> getAs() const
     {
@@ -178,7 +202,10 @@ public:
     }
 
     std::vector<Inspectable*> items;
+    std::vector<Inspectable*> preselected;
     uint32_t revision = 0;
+
+    void touch(); // bump revision + become the active scope
 };
 
 // ---------------------------------------------------------------- Container
@@ -236,11 +263,22 @@ std::vector<Container*>& rootContainers();
 void registerRoot(Container* c);
 void unregisterRoot(Container* c);
 
+// Resolve a control address ("/seq/layer/param") to a Parameter / Container,
+// searching from the registered roots. Returns nullptr when not found.
+Parameter* resolveParamAddress(const std::string& address);
+Container* resolveContainerAddress(const std::string& address);
+
 // ---------------------------------------------------------------- generic parameter widget (defined in OrganicPanels.cpp)
 // Draws the right ImGui widget for the parameter, with undo/redo integration.
 bool DrawParamWidget(Parameter& p);
+// One widget editing several parameters at once (multi-editing).
+// Uses the first parameter for display; applies changes to all of them.
+bool DrawParamWidgetMulti(const std::vector<Parameter*>& params);
 // InputText bound to a std::string with undo integration (used for renames).
 bool UndoableInputText(const char* label, std::string& str, const void* owner,
                        std::function<void(const std::string&, const std::string&)> apply);
+// Popup tree to pick any parameter in the app; returns true when a pick was
+// made and writes its control address. Call ImGui::OpenPopup(popupId) first.
+bool ParamPickerPopup(const char* popupId, std::string& address);
 
 } // namespace organic

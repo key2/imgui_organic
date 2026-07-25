@@ -1,6 +1,8 @@
 // Organic ImGui demo application.
-// Recreates the core experience of juce_organicui / juce_timeline apps
-// (Chataigne-style tooling) with Dear ImGui (docking) + ImPlot.
+// Recreates the core experience of juce_organicui / juce_timeline apps with
+// Dear ImGui (docking) + ImPlot + miniaudio: multi-sequence timelines with
+// audio playback, trigger layers & cues, automation recording, generic
+// manager framework (list + 2D canvas), Curve2D editor, Detective, and more.
 #include "Organic.h"
 #include "imgui.h"
 #include "imgui_internal.h" // BeginViewportSideBar (status bar)
@@ -15,15 +17,57 @@
 namespace fs = std::filesystem;
 using namespace organic;
 
+// ---------------------------------------------------------------- board demo items
+class NoteItem : public BaseItem
+{
+public:
+    NoteItem() : BaseItem("Note", "Note")
+    {
+        textP = addString("Text", "A sticky note.\nEdit me in the Inspector!", "Note content");
+        colorP->setValue(ImVec4(0.72f, 0.62f, 0.25f, 1.f), false);
+        colorP->defaultValue = colorP->value;
+        viewSize = ImVec2(210, 110);
+    }
+    Parameter* textP = nullptr;
+    void canvasGui() override
+    {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.93f, 0.85f, 1.f));
+        ImGui::TextWrapped("%s", textP->stringValue().c_str());
+        ImGui::PopStyleColor();
+    }
+};
+
+class ValueItem : public BaseItem
+{
+public:
+    ValueItem() : BaseItem("Value", "Value")
+    {
+        valueP = addFloat("Value", 0.5f, 0.f, 1.f, "A live value; watch it in the Detective!");
+        colorP->setValue(ImVec4(0.30f, 0.55f, 0.75f, 1.f), false);
+        colorP->defaultValue = colorP->value;
+        viewSize = ImVec2(220, 96);
+    }
+    Parameter* valueP = nullptr;
+    void canvasGui() override
+    {
+        DrawParamWidget(*valueP);
+        ImGui::ProgressBar(valueP->floatValue(), ImVec2(-8, 6), "");
+    }
+};
+
 // ---------------------------------------------------------------- app model
 struct App
 {
-    Sequence  seq{ "Demo Sequence" };
+    SequenceManager seqs;
     MediaPool pool;
+    BaseManager board{ "Board" };
+    Curve2D motion{ "Motion Path" };
+    Detective detective;
     Container settings{ "Settings" };
     Parameter* autosaveP = nullptr;
     Parameter* autosaveIntervalP = nullptr;
-    Parameter* logParamChangesP = nullptr;
+    Parameter* audioEnabledP = nullptr;
+    Parameter* masterVolP = nullptr;
 
     TimelineUI   tui;
     DockManager  dock;
@@ -46,7 +90,7 @@ static void setupOrganicStyle()
     ImVec4* c = s.Colors;
 
     const ImVec4 accent(1.00f, 0.573f, 0.184f, 1.f); // organicui HIGHLIGHT_COLOR #FF922F
-    const ImVec4 bg(0.129f, 0.129f, 0.133f, 1.f);    // #212122-ish
+    const ImVec4 bg(0.129f, 0.129f, 0.133f, 1.f);
 
     c[ImGuiCol_WindowBg]            = bg;
     c[ImGuiCol_ChildBg]             = ImVec4(0, 0, 0, 0);
@@ -134,9 +178,10 @@ static void populateDemoMedia(App& app)
     fx->durP->setValue(3.f, false);
 }
 
-static void populateDemoSequence(App& app)
+static void populateDemoProject(App& app)
 {
-    Sequence& seq = app.seq;
+    // ---- sequence 1: audio + blocks + automation + gradient
+    Sequence& seq = *app.seqs.addSequence("Demo Sequence");
     seq.lengthP->setValue(16.f, false);
 
     auto* audio = static_cast<ClipLayer*>(seq.addLayer(Layer::LType::Clips, "Audio A"));
@@ -144,10 +189,13 @@ static void populateDemoSequence(App& app)
     b1->setAudioFile("assets/beat.wav");
     Clip* b2 = audio->addClip(Clip::CType::Audio, "Beat", 4.0, 4.0);
     b2->setAudioFile("assets/beat.wav");
+    b2->fadeOutP->setValue(1.5f, false);
     Clip* sw = audio->addClip(Clip::CType::Audio, "Sweep", 8.0, 4.0);
     sw->setAudioFile("assets/sweep.wav");
-    Clip* tn = audio->addClip(Clip::CType::Audio, "Tone", 12.5, 2.0);
+    sw->fadeInP->setValue(0.8f, false);
+    Clip* tn = audio->addClip(Clip::CType::Audio, "Tone", 12.5, 3.0);
     tn->setAudioFile("assets/tone.wav");
+    tn->loopMediaP->setValue(true, false);
 
     auto* blocks = static_cast<ClipLayer*>(seq.addLayer(Layer::LType::Clips, "Blocks"));
     Clip* c1 = blocks->addClip(Clip::CType::Block, "Intro", 0.0, 3.0);
@@ -166,7 +214,7 @@ static void populateDemoSequence(App& app)
     energy->addKey(6.0, 0.8f, EasingType::Bounce);
     energy->addKey(8.0, 0.5f, EasingType::Steps);
     energy->addKey(10.0, 0.95f, EasingType::Sine);
-    energy->addKey(12.0, 0.2f, EasingType::Linear);
+    energy->addKey(12.0, 0.2f, EasingType::Perlin);
     energy->addKey(15.5, 0.75f, EasingType::Linear);
 
     auto* mood = static_cast<GradientLayer*>(seq.addLayer(Layer::LType::Gradient, "Mood"));
@@ -176,6 +224,82 @@ static void populateDemoSequence(App& app)
     mood->addKey(9.0,  ImVec4(0.80f, 0.20f, 0.55f, 1.f));
     mood->addKey(12.0, ImVec4(0.20f, 0.15f, 0.45f, 1.f));
 
+    // ---- sequence 2: cues, triggers, loop range, beats
+    Sequence& show = *app.seqs.addSequence("Show");
+    show.lengthP->setValue(24.f, false);
+    show.bpmP->setValue(100.f, false);
+
+    auto* trig = static_cast<TriggerLayer*>(show.addLayer(Layer::LType::Triggers, "Cues & FX"));
+    trig->addTrigger(2.0, "Lights Up");
+    TimeTrigger* boom = trig->addTrigger(6.0, "Boom");
+    boom->flagY = 0.6f;
+    trig->addTrigger(12.0, "Blackout");
+
+    auto* fade = static_cast<AutomationLayer*>(show.addLayer(Layer::LType::Automation, "Master"));
+    fade->rangeMaxP->setValue(100.f, false);
+    fade->addKey(0.0, 0.f, EasingType::Linear);
+    fade->addKey(4.0, 100.f, EasingType::Bezier);
+    fade->addKey(12.0, 100.f, EasingType::Linear);
+    fade->addKey(14.0, 0.f, EasingType::Bounce);
+
+    auto* showAudio = static_cast<ClipLayer*>(show.addLayer(Layer::LType::Clips, "Music"));
+    Clip* loop = showAudio->addClip(Clip::CType::Audio, "Loop", 2.0, 10.0);
+    loop->setAudioFile("assets/beat.wav");
+    loop->loopMediaP->setValue(true, false);
+    loop->fadeInP->setValue(0.5f, false);
+    loop->fadeOutP->setValue(2.0f, false);
+
+    show.addCue(2.0, "Start");
+    show.addCue(6.0, "Drop");
+    show.addCue(12.0, "Outro");
+    show.loopIn = 2.0;
+    show.loopOut = 14.0;
+
+    app.seqs.currentIndex = 0;
+
+    // ---- board
+    NoteItem* n1 = static_cast<NoteItem*>(app.board.addItem(std::make_unique<NoteItem>()));
+    n1->setNiceName("Welcome");
+    n1->textP->setValue(std::string("This board is the generic 2D canvas:\n"
+                                    "drag cards by their title, resize corners,\n"
+                                    "rubber-band select, align with the toolbar,\n"
+                                    "navigate with the minimap."), false);
+    n1->viewPos = ImVec2(-260, -120);
+    n1->viewSize = ImVec2(260, 128);
+
+    NoteItem* n2 = static_cast<NoteItem*>(app.board.addItem(std::make_unique<NoteItem>()));
+    n2->setNiceName("Tip");
+    n2->textP->setValue(std::string("Right-click any parameter and\n'Watch in Detective' to plot it."), false);
+    n2->viewPos = ImVec2(40, -140);
+    n2->colorP->setValue(ImVec4(0.35f, 0.6f, 0.4f, 1.f), false);
+
+    ValueItem* v1 = static_cast<ValueItem*>(app.board.addItem(std::make_unique<ValueItem>()));
+    v1->setNiceName("Fader A");
+    v1->viewPos = ImVec2(-240, 60);
+    ValueItem* v2 = static_cast<ValueItem*>(app.board.addItem(std::make_unique<ValueItem>()));
+    v2->setNiceName("Fader B");
+    v2->viewPos = ImVec2(30, 40);
+    v2->colorP->setValue(ImVec4(0.6f, 0.35f, 0.55f, 1.f), false);
+
+    // link demo media to first audio clip (linked inspectables: select one,
+    // the other highlights)
+    if (!app.pool.items.empty())
+        linkInspectables(b1, app.pool.items[0].get());
+
+    // ---- motion path
+    app.motion.addKey(ImVec2(0.1f, 0.2f));
+    Curve2DKey* mk = app.motion.addKey(ImVec2(0.4f, 0.8f));
+    mk->bezier = true;
+    mk->a1 = ImVec2(0.25f, 0.1f);
+    mk->a2 = ImVec2(-0.2f, 0.15f);
+    app.motion.addKey(ImVec2(0.8f, 0.6f));
+    app.motion.addKey(ImVec2(0.9f, 0.15f));
+    app.motion.rebuild();
+
+    // ---- detective defaults
+    app.detective.watch(v1->valueP->controlAddress());
+    if (Parameter* out = energy->outputP) app.detective.watch(out->controlAddress());
+
     OLOG("Engine", "Demo project created");
 }
 
@@ -184,9 +308,12 @@ static bool saveProject(App& app, const std::string& path)
 {
     json j;
     j["app"] = "imgui_organic";
-    j["version"] = 1;
-    j["sequence"] = app.seq.save();
+    j["version"] = 2;
+    j["sequences"] = app.seqs.save();
     j["media"] = app.pool.save();
+    j["board"] = app.board.save();
+    j["motion"] = app.motion.save();
+    j["detective"] = app.detective.save();
     j["settings"] = app.settings.save();
     std::ofstream f(path);
     if (!f.is_open())
@@ -215,8 +342,17 @@ static bool loadProject(App& app, const std::string& path)
         Selection::get().clear();
         UndoManager::get().clear();
         if (j.contains("media"))    app.pool.load(j["media"]);
-        if (j.contains("sequence")) app.seq.load(j["sequence"]);
-        if (j.contains("settings")) app.settings.load(j["settings"]);
+        if (j.contains("sequences")) app.seqs.load(j["sequences"]);
+        else if (j.contains("sequence")) // v1 migration
+        {
+            app.seqs.sequences.clear();
+            Sequence* s = app.seqs.addSequence("Sequence");
+            s->load(j["sequence"]);
+        }
+        if (j.contains("board"))     app.board.load(j["board"]);
+        if (j.contains("motion"))    app.motion.load(j["motion"]);
+        if (j.contains("detective")) app.detective.load(j["detective"]);
+        if (j.contains("settings"))  app.settings.load(j["settings"]);
         app.projectPath = path;
         snprintf(app.pathBuf, sizeof(app.pathBuf), "%s", path.c_str());
         OLOG("Engine", "Project loaded from '" << path << "'");
@@ -233,21 +369,22 @@ static void newProject(App& app)
 {
     Selection::get().clear();
     UndoManager::get().clear();
-    app.seq.layers.clear();
-    app.seq.setNiceName("Sequence");
-    app.seq.lengthP->resetToDefault(false);
-    app.seq.currentTime = 0;
-    app.seq.playing = false;
+    app.seqs.sequences.clear();
+    app.seqs.addSequence("Sequence");
+    app.board.items.clear();
+    app.motion.keys.clear();
+    app.motion.rebuild();
     OLOG("Engine", "New project");
 }
 
-// ---------------------------------------------------------------- app state (window prefs)
+// ---------------------------------------------------------------- app state
 static void saveAppState(App& app)
 {
     json j;
     j["dock"] = app.dock.saveState();
     j["projectPath"] = app.projectPath;
     j["timeline"] = { { "snap", app.tui.snapEnabled }, { "snapChoice", app.tui.snapChoice },
+                      { "magnet", app.tui.magnetEnabled }, { "gridMode", app.tui.gridMode },
                       { "follow", app.tui.followPlayhead } };
     std::ofstream f("organic_app.json");
     f << j.dump(2);
@@ -270,10 +407,71 @@ static void loadAppState(App& app)
         {
             app.tui.snapEnabled    = j["timeline"].value("snap", true);
             app.tui.snapChoice     = j["timeline"].value("snapChoice", 0);
+            app.tui.magnetEnabled  = j["timeline"].value("magnet", true);
+            app.tui.gridMode       = j["timeline"].value("gridMode", 0);
             app.tui.followPlayhead = j["timeline"].value("follow", true);
         }
     }
     catch (...) {}
+}
+
+// ---------------------------------------------------------------- timeline panel (sequence tabs)
+static void timelinePanel(App& app, bool* open)
+{
+    ImGui::SetNextWindowSize(ImVec2(1000, 480), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Timeline", open, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse))
+    {
+        ImGui::End();
+        return;
+    }
+
+    SequenceManager& seqs = app.seqs;
+    if (ImGui::BeginTabBar("##seqtabs", ImGuiTabBarFlags_AutoSelectNewTabs |
+                                        ImGuiTabBarFlags_FittingPolicyScroll))
+    {
+        Sequence* toRemove = nullptr;
+        for (size_t i = 0; i < seqs.sequences.size(); i++)
+        {
+            Sequence* s = seqs.sequences[i].get();
+            std::string label = s->niceName + "###seqtab" + std::to_string(s->managerUid);
+            bool tabOpen = true;
+            bool canClose = seqs.sequences.size() > 1;
+            if (ImGui::BeginTabItem(label.c_str(), canClose ? &tabOpen : nullptr))
+            {
+                seqs.currentIndex = (int)i;
+                app.tui.body(*s);
+                ImGui::EndTabItem();
+            }
+            if (!tabOpen) toRemove = s;
+        }
+        if (ImGui::TabItemButton("+", ImGuiTabItemFlags_Trailing | ImGuiTabItemFlags_NoTooltip))
+        {
+            SequenceManager* mp = &seqs;
+            Sequence* ns = seqs.addSequence("Sequence " + std::to_string(seqs.sequences.size() + 1));
+            json data = ns->save();
+            data["managerUid"] = ns->managerUid;
+            data["_index"] = seqs.indexOf(ns);
+            uint64_t uid = ns->managerUid;
+            UndoManager::get().pushDone("Add Sequence",
+                [mp, data] { mp->addSequenceFromJson(data, data.value("_index", -1)); },
+                [mp, uid]  { if (Sequence* ss = mp->findByUid(uid)) mp->removeSequence(ss); },
+                { mp });
+            ns->select();
+        }
+        ImGui::EndTabBar();
+
+        if (toRemove)
+        {
+            SequenceManager* mp = &seqs;
+            json data = seqs.removeSequence(toRemove);
+            uint64_t uid = data.value("managerUid", (uint64_t)0);
+            UndoManager::get().pushDone("Remove Sequence",
+                [mp, uid]  { if (Sequence* ss = mp->findByUid(uid)) mp->removeSequence(ss); },
+                [mp, data] { mp->addSequenceFromJson(data, data.value("_index", -1)); },
+                { mp });
+        }
+    }
+    ImGui::End();
 }
 
 // ---------------------------------------------------------------- menus / popups / status bar
@@ -366,12 +564,13 @@ static void appPopups(App& app)
     {
         ImGui::Text("imgui_organic - organicui-style tooling for Dear ImGui");
         ImGui::Separator();
-        ImGui::BulletText("Dockable panels with saveable layouts (ShapeShifter)");
-        ImGui::BulletText("Parameter/Container model + auto Inspector");
-        ImGui::BulletText("Timeline: clips, drag & drop, waveforms, automation, gradients");
-        ImGui::BulletText("Undo/redo everywhere, JSON projects");
+        ImGui::BulletText("Dockable panels with saveable layouts");
+        ImGui::BulletText("Multi-sequence timelines: clips, waveforms, audio playback,");
+        ImGui::BulletText("  automation (+recorder), gradients, triggers, cues, loop ranges");
+        ImGui::BulletText("Generic manager framework: list + 2D canvas (Board panel)");
+        ImGui::BulletText("Curve2D editor, Detective, multi-edit Inspector, undo everywhere");
         ImGui::TextDisabled("Inspired by benkuper/juce_organicui + juce_timeline.");
-        ImGui::TextDisabled("Built with Dear ImGui (docking) %s + ImPlot.", IMGUI_VERSION);
+        ImGui::TextDisabled("Built with Dear ImGui (docking) %s + ImPlot + miniaudio.", IMGUI_VERSION);
         ImGui::Spacing();
         if (ImGui::Button("Close", ImVec2(120, 0))) ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
@@ -388,16 +587,21 @@ static void statusBar(App& app)
     {
         if (ImGui::BeginMenuBar())
         {
+            Sequence* seq = app.seqs.current();
             ImVec4 accent(1.f, 0.573f, 0.184f, 1.f);
-            ImGui::TextColored(app.seq.playing ? ImVec4(0.3f, 0.9f, 0.4f, 1.f) : ImVec4(0.6f, 0.6f, 0.62f, 1.f),
-                               app.seq.playing ? "PLAYING" : "STOPPED");
+            bool playing = seq && seq->playing;
+            ImGui::TextColored(playing ? ImVec4(0.3f, 0.9f, 0.4f, 1.f) : ImVec4(0.6f, 0.6f, 0.62f, 1.f),
+                               playing ? "PLAYING" : "STOPPED");
             ImGui::Separator();
-            ImGui::TextColored(accent, "%s", formatTime(app.seq.currentTime).c_str());
+            ImGui::TextColored(accent, "%s", seq ? formatTime(seq->currentTime).c_str() : "-");
             ImGui::Separator();
-            ImGui::Text("%d selected", (int)Selection::get().items.size());
+            ImGui::Text("%d selected", (int)(Selection::active() ? Selection::active()->items.size() : 0));
             ImGui::Separator();
             auto& um = UndoManager::get();
             ImGui::TextDisabled("undo: %s", um.canUndo() ? um.undoName().c_str() : "-");
+            ImGui::Separator();
+            AudioEngine& ae = AudioEngine::get();
+            ImGui::TextDisabled(ae.ok() ? "audio: %s" : "audio: off", ae.deviceName.c_str());
             ImGui::Separator();
             ImGui::TextDisabled("%s", app.projectPath.c_str());
 
@@ -422,7 +626,7 @@ int main(int, char**)
 
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
-    GLFWwindow* window = glfwCreateWindow(1680, 940, "Organic ImGui - docking + timeline demo", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(1720, 960, "Organic ImGui - docking + timeline demo", nullptr, nullptr);
     if (!window) { glfwTerminate(); return 1; }
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
@@ -433,11 +637,10 @@ int main(int, char**)
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
-    io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable; // floating OS windows (ShapeShifterWindow)
+    io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
     io.IniFilename = "organic_imgui.ini";
     io.ConfigDockingWithShift = false;
 
-    // font
     {
         std::string fontPath = std::string(ORGANIC_FONT_DIR) + "/Roboto-Medium.ttf";
         if (fs::exists(fontPath)) io.Fonts->AddFontFromFileTTF(fontPath.c_str(), 16.f);
@@ -453,10 +656,20 @@ int main(int, char**)
     app.autosaveP = app.settings.addBool("Autosave", true, "Periodically save to autosave.organic.json");
     app.autosaveIntervalP = app.settings.addFloat("Autosave Interval", 60.f, 5.f, 600.f, "Seconds between autosaves");
     app.autosaveIntervalP->unit = "s";
-    app.logParamChangesP = app.settings.addBool("Verbose Media Log", false, "Log every media payload drop");
+    app.audioEnabledP = app.settings.addBool("Audio Output", true, "Play the current sequence's audio clips");
+    app.masterVolP = app.settings.addFloat("Master Volume", 0.8f, 0.f, 1.f, "Audio output volume");
 
-    registerRoot(&app.seq);
+    app.board.selectionScopeName = "board";
+    app.board.addDef("Basics/Note", "Note", [] { return std::make_unique<NoteItem>(); });
+    app.board.addDef("Basics/Value", "Value", [] { return std::make_unique<ValueItem>(); });
+
+    Detective::main = &app.detective;
+
+    registerRoot(&app.seqs);
     registerRoot(&app.pool);
+    registerRoot(&app.board);
+    registerRoot(&app.motion);
+    registerRoot(&app.detective);
     registerRoot(&app.settings);
 
     ensureDemoAssets();
@@ -464,11 +677,38 @@ int main(int, char**)
     if (fs::exists(app.projectPath))
         loadProject(app, app.projectPath);
     else
-        populateDemoSequence(app);
+        populateDemoProject(app);
+    if (app.seqs.sequences.empty()) app.seqs.addSequence("Sequence");
+
+    AudioEngine::get().init();
 
     // ------------------------------------------------------------ panels
-    app.dock.addPanel("Timeline", DockZone::Center, [&](bool* o) { app.tui.gui(app.seq, o); });
+    app.dock.addPanel("Timeline", DockZone::Center, [&](bool* o) { timelinePanel(app, o); });
+    app.dock.addPanel("Board", DockZone::Center, [&](bool* o)
+    {
+        ImGui::SetNextWindowSize(ImVec2(800, 500), ImGuiCond_FirstUseEver);
+        if (ImGui::Begin("Board", o)) ManagerCanvasUI(app.board);
+        ImGui::End();
+    });
+    app.dock.addPanel("Board List", DockZone::LeftBottom, [&](bool* o)
+    {
+        if (ImGui::Begin("Board List", o)) ManagerListUI(app.board);
+        ImGui::End();
+    }, false);
+    app.dock.addPanel("Motion Path", DockZone::Center, [&](bool* o)
+    {
+        ImGui::SetNextWindowSize(ImVec2(600, 480), ImGuiCond_FirstUseEver);
+        if (ImGui::Begin("Motion Path", o))
+        {
+            Sequence* s = app.seqs.current();
+            float norm = s && s->totalTime() > 0 ? (float)(s->currentTime / s->totalTime()) : -1.f;
+            ImGui::TextDisabled("The dot travels along the curve as the current sequence plays (arc-length parameterized).");
+            Curve2DEditor(app.motion, norm);
+        }
+        ImGui::End();
+    }, false);
     app.dock.addPanel("Inspector", DockZone::Right, [](bool* o) { InspectorPanel(o); });
+    app.dock.addPanel("Detective", DockZone::RightBottom, [&](bool* o) { DetectivePanel(app.detective, o); });
     app.dock.addPanel("Scope", DockZone::RightBottom, [&](bool* o) { ScopePanel(app.scope, o); });
     app.dock.addPanel("Outliner", DockZone::Left, [](bool* o) { OutlinerPanel(o); });
     app.dock.addPanel("Media Pool", DockZone::LeftBottom, [&](bool* o) { MediaPoolPanel(app.pool, o); });
@@ -479,6 +719,9 @@ int main(int, char**)
         {
             app.settings.inspectorGui();
             ImGui::Separator();
+            AudioEngine& ae = AudioEngine::get();
+            if (ae.ok()) ImGui::TextDisabled("Audio: %s @ %d Hz", ae.deviceName.c_str(), ae.deviceSampleRate);
+            else         ImGui::TextDisabled("Audio: no device");
             ImGui::TextDisabled("Layouts dir: ./layouts");
             ImGui::TextDisabled("ImGui ini:  ./organic_imgui.ini");
         }
@@ -493,7 +736,7 @@ int main(int, char**)
     while (!glfwWindowShouldClose(window))
     {
         glfwPollEvents();
-        app.dock.preNewFrame(); // apply pending layout loads before NewFrame
+        app.dock.preNewFrame();
 
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
@@ -503,8 +746,15 @@ int main(int, char**)
         double dt = now - lastTime;
         lastTime = now;
 
-        app.seq.update(dt);
-        app.scope.push(app.seq, now);
+        app.seqs.update(dt);
+        app.detective.update(now);
+        if (Sequence* cur = app.seqs.current()) app.scope.push(*cur, now);
+
+        // audio
+        AudioEngine& ae = AudioEngine::get();
+        ae.setMuted(!app.audioEnabledP->boolValue());
+        ae.setMasterVolume(app.masterVolP->floatValue());
+        ae.syncFromSequence(app.seqs.current());
 
         mainMenuBar(app);
         statusBar(app);
@@ -516,7 +766,6 @@ int main(int, char**)
         if (app.showImGuiDemo)  ImGui::ShowDemoWindow(&app.showImGuiDemo);
         if (app.showImPlotDemo) ImPlot::ShowDemoWindow(&app.showImPlotDemo);
 
-        // global shortcuts
         if (!io.WantTextInput)
         {
             if (io.KeyCtrl && !io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z, false)) UndoManager::get().undo();
@@ -527,13 +776,15 @@ int main(int, char**)
 
         CommitPendingParamEdits();
 
-        // autosave
         if (app.autosaveP->boolValue() && now - app.lastAutosave > app.autosaveIntervalP->floatValue())
         {
             app.lastAutosave = now;
             json j;
-            j["sequence"] = app.seq.save();
+            j["sequences"] = app.seqs.save();
             j["media"] = app.pool.save();
+            j["board"] = app.board.save();
+            j["motion"] = app.motion.save();
+            j["detective"] = app.detective.save();
             j["settings"] = app.settings.save();
             std::ofstream f("autosave.organic.json");
             if (f.is_open()) { f << j.dump(); OLOG("Engine", "Autosaved"); }
@@ -558,6 +809,7 @@ int main(int, char**)
     }
 
     saveAppState(app);
+    AudioEngine::get().shutdown();
 
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();

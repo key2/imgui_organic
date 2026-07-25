@@ -12,6 +12,7 @@ else()
 endif()
 
 option(ORGANIC_BUILD_DEMO "Build the organic_demo application (needs GLFW + OpenGL)" ${ORGANIC_TOP_LEVEL})
+option(ORGANIC_BUILD_TESTS "Build the headless model tests" OFF)
 
 # Dear ImGui is NOT vendored: point this to your own checkout of the *docking*
 # branch (https://github.com/ocornut/imgui/tree/docking). If left empty, the
@@ -111,11 +112,22 @@ if(NOT EXISTS "${ORGANIC_JSON_INCLUDE}/nlohmann/json.hpp")
         "Run: git submodule update --init --recursive")
 endif()
 
+# ---------------------------------------------------------------- miniaudio (submodule)
+set(ORGANIC_MINIAUDIO_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/miniaudio")
+if(NOT EXISTS "${ORGANIC_MINIAUDIO_INCLUDE}/miniaudio.h")
+    message(FATAL_ERROR
+        "imgui_organic: miniaudio submodule missing.\n"
+        "Run: git submodule update --init --recursive")
+endif()
+
 # ---------------------------------------------------------------- organic library
 set(ORGANIC_SOURCES
     organic/OrganicCore.cpp
     organic/OrganicEasing.cpp
     organic/OrganicAudio.cpp
+    organic/OrganicAudioEngine.cpp
+    organic/OrganicManager.cpp
+    organic/OrganicCurve2D.cpp
     organic/OrganicTimeline.cpp
     organic/OrganicTimelineUI.cpp
     organic/OrganicPanels.cpp
@@ -135,7 +147,10 @@ target_include_directories(organic PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/organic
     ${ORGANIC_JSON_INCLUDE}            # <nlohmann/json.hpp>
     ${ORGANIC_JSON_INCLUDE}/nlohmann   # "json.hpp" (used internally)
+    ${ORGANIC_MINIAUDIO_INCLUDE}       # miniaudio.h
 )
+find_package(Threads REQUIRED)
+target_link_libraries(organic PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
 if(NOT _organic_created_imgui AND NOT _imgui_dir STREQUAL "")
     target_include_directories(organic PRIVATE ${_imgui_dir}/misc/cpp)
 endif()
@@ -167,4 +182,12 @@ if(ORGANIC_BUILD_DEMO)
     target_compile_definitions(organic_demo PRIVATE
         ORGANIC_FONT_DIR="${_imgui_dir}/misc/fonts"
     )
+endif()
+
+# ---------------------------------------------------------------- tests
+if(ORGANIC_BUILD_TESTS)
+    add_executable(organic_tests tests/model_test.cpp)
+    target_link_libraries(organic_tests PRIVATE organic)
+    enable_testing()
+    add_test(NAME organic_model_tests COMMAND organic_tests)
 endif()

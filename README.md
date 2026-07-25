@@ -16,31 +16,56 @@ content on rich timelines.
   tear tabs off into real OS windows (multi-viewport), save/load **named layouts**
   (`Ctrl+1..9`), reset to a default layout, Panels menu. The ImGui take on
   organicui's *ShapeShifter*.
-- **Timeline editor** (`TimelineUI`)
+- **Timeline editor** (`TimelineUI`) — multiple sequences in tabs:
   - Clip layers: drag & drop boxes, move across layers, resize with edge grips,
-    multi-select (rubber band / `Ctrl`), duplicate, snapping grid, context menus.
-  - **Audio clips draw their waveform** (WAV: PCM 8/16/24/32 & float32) with gain
-    and media offset; trimming the left edge keeps the audio in place.
+    multi-select (rubber band with preselection / `Ctrl`), duplicate, split,
+    copy/paste at the playhead, grid **and magnet snapping** (clip edges, keys,
+    cues, playhead), context menus everywhere.
+  - **Audio clips play back** (miniaudio) and draw their waveform (WAV: PCM
+    8/16/24/32 & float32) with gain, media offset, **fade in/out handles** and
+    **media looping** (tiling); left-trimming keeps the audio in place.
   - **Automation layers**: keyframe curves with per-segment easings — Linear,
-    **Bezier (draggable handles)**, Hold, Sine, Elastic, Bounce, Steps, Noise.
-  - **Gradient layers**: time→color tracks with draggable color keys.
-  - Time ruler with scrubbing, playhead, loop, zoom-at-mouse, pan, fit,
-    follow-playhead, adaptive snapping (`Alt` bypasses).
+    **Bezier (draggable handles)**, Hold, Sine, Elastic, Bounce, Steps, Noise,
+    Perlin — plus in-lane frequency/amplitude/steps handles, shape-preserving
+    key insertion, a **multi-key transform box** (move/scale selections),
+    proportional range remapping, and a **live recorder** (arm, record any
+    parameter, simplify to RDP lines or fitted Beziers).
+  - **Gradient layers**: time→color tracks with draggable keys + hold mode.
+  - **Trigger layers**: cue flags that fire callbacks (and log) when the
+    playhead crosses them.
+  - Ruler with **time cues** (jump/navigate), **loop in/out range**,
+    play modes (Once / Loop / **Ping-Pong**, audio plays reversed), musical
+    **BPM grid** (bars/beats snapping), ripple **insert/remove time**,
+    scrubbing, zoom-at-mouse, pan, fit, follow-playhead (`Alt` bypasses snap).
+- **Generic manager framework** (organicui's BaseManager/BaseItem):
+  - `ManagerListUI` — searchable list with drag-reorder, enable toggles, color
+    swatches, mini-mode, factory "+ Add" menus, full keyboard control.
+  - `ManagerCanvasUI` — infinite **2D canvas**: pan/zoom, movable/resizable
+    cards with live widgets, **snap-to-item guides**, align/distribute toolbar,
+    **minimap**, rubber-band preselection, clipboard copy/paste across managers.
+- **Curve2D** — arc-length parameterized 2D spatial curves (linear/Bezier
+  segments) with a pan/zoom editor; drive positions from any timeline.
 - **Parameter / Container data model** — typed parameters (Trigger, Bool, Int,
   Float, String, Enum, Color, Point2D) with ranges, defaults, descriptions,
-  control addresses (`/root/child/param`), change notification bubbling and JSON
-  serialization.
-- **Auto-generated Inspector** — select anything (clips, layers, keys, media,
-  your own containers) and edit it; multi-selection supported.
-- **Undo/redo everywhere** — drags, drops, renames, key edits and parameter
-  widgets are undoable; continuous edits coalesce into single steps.
+  control addresses (`/root/child/param`), address resolution, change
+  notification bubbling and JSON serialization.
+- **Inspector with true multi-editing** — homogeneous multi-selections edit all
+  objects through one widget set (single undo step, "(mixed)" indicators);
+  per-selection scroll memory.
+- **Selection system** — multiple named scopes (per-panel), preselection while
+  rubber-banding, and **linked inspectables** (selecting one highlights the other).
+- **Undo/redo everywhere** — drags, drops, renames, key edits, recordings and
+  parameter widgets are undoable; continuous edits coalesce into single steps.
 - **Standard panels** — Outliner (filterable hierarchy tree), Logger
   (`OLOG/OLOGW/OLOGE`), Media Pool (drag sources for the timeline), Scope
-  (ImPlot rolling plot of automation outputs — organicui's *Detective*).
+  (automation outputs), and the **Detective**: watch *any* parameter over time
+  (right-click a widget → *Watch in Detective*).
 - **JSON projects** — save/load the whole document; autosave.
 
 The full user manual (every shortcut and interaction, plus in-depth API
-examples) lives in **[USAGE.md](USAGE.md)**.
+examples) lives in **[USAGE.md](USAGE.md)**. For a feature-parity audit against
+juce_organicui (what's not ported yet and how hard each piece would be), see
+**[MISSING_FEATURES.md](MISSING_FEATURES.md)**.
 
 ---
 
@@ -48,13 +73,16 @@ examples) lives in **[USAGE.md](USAGE.md)**.
 
 ```
 imgui_organic/
-├── organic/            the library (this is what you link)
-├── app/main.cpp        full demo application (GLFW + OpenGL3)
-├── implot/             [submodule]  epezent/implot        (pinned, v1.0 API)
-├── third_party/json/   [submodule]  nlohmann/json         (pinned, v3.12.0)
+├── organic/                the library (this is what you link)
+├── app/main.cpp            full demo application (GLFW + OpenGL3)
+├── tests/model_test.cpp    headless model tests (-DORGANIC_BUILD_TESTS=ON)
+├── implot/                 [submodule]  epezent/implot     (pinned, v1.0 API)
+├── third_party/json/       [submodule]  nlohmann/json      (pinned, v3.12.0)
+├── third_party/miniaudio/  [submodule]  mackron/miniaudio  (pinned, audio playback)
 ├── CMakeLists.txt
-├── README.md           this file
-└── USAGE.md            full manual + API examples
+├── README.md               this file
+├── USAGE.md                full manual + API examples
+└── MISSING_FEATURES.md     parity audit vs juce_organicui
 ```
 
 | Dependency | How it is provided |
@@ -62,11 +90,12 @@ imgui_organic/
 | **Dear ImGui — docking branch** | **You clone it yourself** (not a submodule, so you control the exact version and can share it with the rest of your app). Known-good commit: `9b4eb24` (v1.92.9 docking). |
 | ImPlot | git submodule, pinned |
 | nlohmann/json | git submodule, pinned (single header, shallow) |
+| miniaudio | git submodule, pinned (single header; timeline audio playback) |
 | GLFW + OpenGL | system packages — **only needed by the demo**, not by the library |
 
-The `organic` library itself depends only on `imgui` + `implot` + the json
-header. It contains **no windowing/backend code**, so it works with any ImGui
-backend (GLFW, SDL2/3, Win32, Metal, ...).
+The `organic` library depends only on `imgui` + `implot` + the json and
+miniaudio headers (plus pthread/dl on Linux). It contains **no windowing/backend
+code**, so it works with any ImGui backend (GLFW, SDL2/3, Win32, Metal, ...).
 
 ---
 
@@ -99,19 +128,31 @@ cmake --build build -j
 ./build/organic_demo
 ```
 
-You get a Chataigne-style workspace: Timeline (audio clips with waveforms,
-blocks, an automation curve, a gradient track), Inspector, Outliner, Media Pool,
-Scope, Logger. Try:
+You get a Chataigne-style workspace: a tabbed Timeline ("Demo Sequence" with
+audio/blocks/automation/gradient, and "Show" with triggers, cues and a loop
+range), Inspector, Outliner, Media Pool, Detective, Scope, Logger — plus a
+**Board** canvas and **Motion Path** editor in the Panels menu. Try:
 
-- `Space` to play; drag media from the **Media Pool** onto the timeline;
-- drag clips around (also vertically between layers), resize their edges;
-- double-click an automation lane to add keys, right-click a key to change its
-  easing, drag the white squares of a Bezier key;
+- `Space` to play — the audio clips are audible (Settings panel: volume/off);
+- drag media from the **Media Pool** onto the timeline; drag clips around
+  (also vertically between layers), resize edges, drag the fade handles of a
+  selected audio clip, right-click → *Split Here*;
+- double-click an automation lane to add keys (inside a Bezier segment the
+  shape is preserved), right-click a key to change its easing, drag Bezier
+  squares or the mid-segment handle of Sine/Steps keys; select several keys and
+  use the **transform box** to move/scale them together;
+- arm a recording: select the "Energy" layer → *Pick record source...* →
+  e.g. `/board/faderA/value` → enable *Record Arm* → play, wiggle the fader in
+  the **Board** panel, stop: the movement becomes keys (Bezier-fitted);
+- switch to the "Show" tab: `PageUp/PageDown` jump between cues, the trigger
+  flags fire in the Logger as the playhead crosses them;
+- right-click any parameter → *Watch in Detective*;
 - drag any window tab to re-dock it, or pull it outside the app to detach it;
 - **View → Save Layout As...**, then reload it with `Ctrl+1`;
 - `Ctrl+Z` undoes *everything*, `Ctrl+S` saves `project.organic.json`.
 
 First run generates demo WAVs in `./assets` and a demo project.
+Run the headless test suite with `-DORGANIC_BUILD_TESTS=ON` → `./build/organic_tests`.
 
 ---
 
@@ -290,13 +331,16 @@ the same mechanism.
 | Header | Contents |
 |---|---|
 | `Organic.h` | umbrella include |
-| `OrganicCore.h` | `Parameter`, `Container`, `Selection`, `UndoManager`, `Logger`, `OLOG` macros, `DrawParamWidget` |
-| `OrganicTimeline.h` | `Sequence`, `ClipLayer`/`Clip`, `AutomationLayer`/`AutoKey`, `GradientLayer`, `MediaPool`, `MediaPayload` |
-| `OrganicTimelineUI.h` | `TimelineUI` (the editor window) |
-| `OrganicPanels.h` | `InspectorPanel`, `OutlinerPanel`, `LoggerPanel`, `MediaPoolPanel`, `ScopePanel`, `CommitPendingParamEdits` |
+| `OrganicCore.h` | `Parameter`, `Container`, `Selection` (scopes/preselection), `linkInspectables`, `resolveParamAddress`, `UndoManager`, `Logger`, `OLOG` macros, `DrawParamWidget(Multi)`, `ParamPickerPopup` |
+| `OrganicManager.h` | `BaseItem`, `BaseManager` (factory, clipboard, undoable ops), `ManagerListUI`, `ManagerCanvasUI` |
+| `OrganicTimeline.h` | `SequenceManager`, `Sequence` (cues, loop range, play modes, ripple edits), `ClipLayer`/`Clip` (fades, media loop), `AutomationLayer` (easings, recorder), `GradientLayer`, `TriggerLayer`, `MediaPool`, `MediaPayload` |
+| `OrganicTimelineUI.h` | `TimelineUI` (the editor; `body()` for embedding, `gui()` for a window) |
+| `OrganicCurve2D.h` | `Curve2D` (arc-length 2D curves) + `Curve2DEditor` |
+| `OrganicPanels.h` | `InspectorPanel` (multi-edit), `OutlinerPanel`, `LoggerPanel`, `MediaPoolPanel`, `ScopePanel`, `Detective`/`DetectivePanel`, `CommitPendingParamEdits` |
 | `OrganicDock.h` | `DockManager`, `DockZone` |
-| `OrganicEasing.h` | `EasingType`, `ease()` |
+| `OrganicEasing.h` | `EasingType`, `ease()`, `splitCubic`, `simplifyRDP`, `fitCubicBeziers` |
 | `OrganicAudio.h` | `loadWav`/`saveWavPcm16`, `Peaks`, `AudioCache`, tone/beat/sweep generators |
+| `OrganicAudioEngine.h` | `AudioEngine` (miniaudio playback of sequence clips) |
 
 ### Runtime files
 
@@ -308,20 +352,24 @@ prefs), `assets/*.wav` (demo audio), `project.organic.json` / `autosave.organic.
 
 ## Quick control reference
 
-`Space` play · ruler-drag scrub · `Ctrl+Wheel` zoom · `Shift+Wheel`/middle-drag pan ·
-`F` fit · drag clips to move (vertically = change layer) · edges resize ·
-rubber-band select · `Ctrl+D` duplicate · `Del` delete · arrows nudge ·
-`Alt` bypass snap · double-click lanes to create clips/keys · right-click for
-context menus (easings, layer ops) · `Ctrl+Z`/`Ctrl+Shift+Z` undo/redo ·
+`Space` play · ruler-drag scrub · `PageUp/PageDown` prev/next cue ·
+`Ctrl+Wheel` zoom · `Shift+Wheel`/middle-drag pan · `F` fit ·
+drag clips to move (vertically = change layer) · edges resize · fade handles on
+selected audio clips · rubber-band (pre)select · `Ctrl+C/V` copy/paste at
+playhead · `Ctrl+D` duplicate · `Del` delete · arrows nudge · `Alt` bypass
+snap · *Magnet* snaps to clip edges/keys/cues/playhead · double-click lanes to
+create clips/keys/triggers · right-click for context menus (easings, split,
+layer ops, loop range, insert/remove time) · `Ctrl+Z`/`Ctrl+Shift+Z` undo/redo ·
 `Ctrl+S` save · `Ctrl+1..9` layouts. Full list in [USAGE.md](USAGE.md).
 
 ## Notes & limitations
 
-- The library draws waveforms but does **not** play audio — bind your own audio
-  engine to `Sequence::currentTime`.
+- Audio playback covers the current sequence's clips (gain, fades, offset,
+  media looping, speed, reversed ping-pong). Loop wraps/seeks resync the audio
+  clock and may produce a small click; there is no per-clip scrub preview.
 - Requires the ImGui **docking** branch (checked at configure time).
-- Tested with ImGui docking `9b4eb24` (1.92.9), ImPlot `d65a2be` (v1.0 API,
-  pinned submodule), nlohmann/json v3.12.0 (pinned submodule), GCC 14, GLFW 3.4.
+- Tested with ImGui docking `9b4eb24` (1.92.9), ImPlot `d65a2be` (v1.0 API),
+  nlohmann/json v3.12.0, miniaudio 0.11.25 (all pinned submodules), GCC 14, GLFW 3.4.
 
 ## Credits & licenses
 

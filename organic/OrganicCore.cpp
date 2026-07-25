@@ -296,50 +296,170 @@ std::string Parameter::controlAddress() const
 }
 
 // ---------------------------------------------------------------- Inspectable / Selection
+static Selection* s_activeSelection = nullptr;
+
 Inspectable::~Inspectable()
 {
-    Selection::get().remove(this);
+    for (Selection* s : Selection::allScopes())
+    {
+        s->remove(this);
+        auto& p = s->preselected;
+        p.erase(std::remove(p.begin(), p.end(), this), p.end());
+    }
+    // remove back-links
+    for (Inspectable* other : std::vector<Inspectable*>(linkedInspectables))
+        unlinkInspectables(this, other);
     UndoManager::get().purgeOwner(this);
 }
 
-bool Inspectable::isSelected() const { return Selection::get().contains(this); }
+bool Inspectable::isSelected() const
+{
+    for (Selection* s : Selection::allScopes())
+        if (s->contains(this)) return true;
+    return false;
+}
+
+bool Inspectable::isPreselected() const
+{
+    for (Selection* s : Selection::allScopes())
+        if (s->preselContains(this)) return true;
+    return false;
+}
+
+bool Inspectable::isHighlighted() const
+{
+    for (Inspectable* other : linkedInspectables)
+        if (other->isSelected()) return true;
+    return false;
+}
+
 void Inspectable::select(bool add)
 {
     if (add) Selection::get().toggle(this);
     else Selection::get().set(this);
 }
 
-Selection& Selection::get() { static Selection s; return s; }
+void linkInspectables(Inspectable* a, Inspectable* b)
+{
+    if (!a || !b || a == b) return;
+    auto addTo = [](Inspectable* x, Inspectable* y)
+    {
+        auto& v = x->linkedInspectables;
+        if (std::find(v.begin(), v.end(), y) == v.end()) v.push_back(y);
+    };
+    addTo(a, b);
+    addTo(b, a);
+}
+
+void unlinkInspectables(Inspectable* a, Inspectable* b)
+{
+    if (!a || !b) return;
+    auto rm = [](Inspectable* x, Inspectable* y)
+    {
+        auto& v = x->linkedInspectables;
+        v.erase(std::remove(v.begin(), v.end(), y), v.end());
+    };
+    rm(a, b);
+    rm(b, a);
+}
+
+std::vector<Selection*>& Selection::allScopes()
+{
+    static std::vector<Selection*> scopes;
+    return scopes;
+}
+
+Selection& Selection::get()
+{
+    static Selection* s = nullptr;
+    if (!s)
+    {
+        s = new Selection();
+        s->name = "main";
+        allScopes().push_back(s);
+        s_activeSelection = s;
+    }
+    return *s;
+}
+
+Selection& Selection::scope(const std::string& n)
+{
+    if (n.empty() || n == "main") return get();
+    for (Selection* s : allScopes())
+        if (s->name == n) return *s;
+    Selection* s = new Selection();
+    s->name = n;
+    allScopes().push_back(s);
+    return *s;
+}
+
+Selection* Selection::active()
+{
+    get(); // ensure main exists
+    return s_activeSelection;
+}
+
+void Selection::touch()
+{
+    revision++;
+    s_activeSelection = this;
+}
 
 void Selection::set(Inspectable* i)
 {
     items.clear();
     if (i) items.push_back(i);
-    revision++;
+    touch();
 }
 void Selection::add(Inspectable* i)
 {
-    if (i && !contains(i)) { items.push_back(i); revision++; }
+    if (i && !contains(i)) { items.push_back(i); touch(); }
 }
 void Selection::toggle(Inspectable* i)
 {
     if (!i) return;
     auto it = std::find(items.begin(), items.end(), i);
     if (it != items.end()) items.erase(it); else items.push_back(i);
-    revision++;
+    touch();
 }
 void Selection::remove(Inspectable* i)
 {
     auto it = std::find(items.begin(), items.end(), i);
-    if (it != items.end()) { items.erase(it); revision++; }
+    if (it != items.end()) { items.erase(it); touch(); }
 }
 void Selection::clear()
 {
-    if (!items.empty()) { items.clear(); revision++; }
+    if (!items.empty() || !preselected.empty())
+    {
+        items.clear();
+        preselected.clear();
+        touch();
+    }
 }
 bool Selection::contains(const Inspectable* i) const
 {
     return std::find(items.begin(), items.end(), i) != items.end();
+}
+
+void Selection::setPreselection(const std::vector<Inspectable*>& its)
+{
+    preselected = its;
+    touch();
+}
+void Selection::clearPreselection()
+{
+    if (!preselected.empty()) { preselected.clear(); touch(); }
+}
+void Selection::commitPreselection()
+{
+    for (Inspectable* i : preselected)
+        if (!contains(i)) items.push_back(i);
+    preselected.clear();
+    touch();
+}
+bool Selection::preselContains(const Inspectable* i) const
+{
+    return std::find(preselected.begin(), preselected.end(), i) != preselected.end();
 }
 
 // ---------------------------------------------------------------- Container
@@ -492,6 +612,73 @@ void unregisterRoot(Container* c)
 {
     auto& r = rootContainers();
     r.erase(std::remove(r.begin(), r.end(), c), r.end());
+}
+
+// ---------------------------------------------------------------- address resolution
+static void splitAddress(const std::string& address, std::vector<std::string>& parts)
+{
+    parts.clear();
+    std::string cur;
+    for (char c : address)
+    {
+        if (c == '/')
+        {
+            if (!cur.empty()) parts.push_back(cur);
+            cur.clear();
+        }
+        else cur.push_back(c);
+    }
+    if (!cur.empty()) parts.push_back(cur);
+}
+
+static Container* findChildByShort(Container* c, const std::string& sn)
+{
+    for (Container* ch : c->children)
+        if (ch->shortName == sn) return ch;
+    return nullptr;
+}
+
+Container* resolveContainerAddress(const std::string& address)
+{
+    std::vector<std::string> parts;
+    splitAddress(address, parts);
+    if (parts.empty()) return nullptr;
+    for (Container* root : rootContainers())
+    {
+        if (root->shortName != parts[0]) continue;
+        Container* cur = root;
+        bool ok = true;
+        for (size_t i = 1; i < parts.size(); i++)
+        {
+            Container* next = findChildByShort(cur, parts[i]);
+            if (!next) { ok = false; break; }
+            cur = next;
+        }
+        if (ok) return cur;
+    }
+    return nullptr;
+}
+
+Parameter* resolveParamAddress(const std::string& address)
+{
+    std::vector<std::string> parts;
+    splitAddress(address, parts);
+    if (parts.size() < 2) return nullptr;
+    for (Container* root : rootContainers())
+    {
+        if (root->shortName != parts[0]) continue;
+        Container* cur = root;
+        bool ok = true;
+        for (size_t i = 1; i + 1 < parts.size(); i++)
+        {
+            Container* next = findChildByShort(cur, parts[i]);
+            if (!next) { ok = false; break; }
+            cur = next;
+        }
+        if (ok)
+            if (Parameter* p = cur->getParam(parts.back())) return p;
+    }
+    return nullptr;
 }
 
 } // namespace organic

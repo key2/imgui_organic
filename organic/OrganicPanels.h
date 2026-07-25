@@ -1,9 +1,11 @@
-// OrganicPanels.h - standard dockable panels: Inspector, Outliner, Logger,
-// Media Pool and Scope (value oscilloscope, organicui's "Detective").
+// OrganicPanels.h - standard dockable panels: Inspector (with multi-editing),
+// Outliner, Logger, Media Pool, Scope (automation outputs) and Detective
+// (watch ANY parameter over time, organicui's Detective).
 #pragma once
 
 #include "OrganicCore.h"
 #include "OrganicTimeline.h"
+#include "OrganicManager.h"
 
 namespace organic
 {
@@ -17,7 +19,8 @@ void OutlinerPanel(bool* open = nullptr);
 void LoggerPanel(bool* open = nullptr);
 void MediaPoolPanel(MediaPool& pool, bool* open = nullptr);
 
-// Scope: rolling plot of every automation layer output (uses ImPlot)
+// ---------------------------------------------------------------- Scope
+// rolling plot of every automation layer output of a sequence (zero config)
 struct ScopeBuffers
 {
     struct Channel
@@ -36,5 +39,33 @@ struct ScopeBuffers
 };
 
 void ScopePanel(ScopeBuffers& buffers, bool* open = nullptr);
+
+// ---------------------------------------------------------------- Detective
+// watch arbitrary parameters (added from any parameter's right-click menu)
+class DetectiveWatcher : public BaseItem
+{
+public:
+    DetectiveWatcher();
+
+    Parameter* addressP = nullptr; // watched parameter address
+    Parameter* windowP  = nullptr; // time window in seconds
+
+    std::vector<float> times, values; // rolling buffer (not serialized)
+
+    void sample(double now);
+    std::string inspectableTypeName() const override { return "Watcher"; }
+};
+
+class Detective : public BaseManager
+{
+public:
+    Detective();
+    static Detective* main; // set by the app; enables "Watch in Detective"
+
+    void update(double now); // call once per frame
+    DetectiveWatcher* watch(const std::string& address); // undoable add
+};
+
+void DetectivePanel(Detective& d, bool* open = nullptr);
 
 } // namespace organic
