@@ -258,9 +258,11 @@ void TimelineUI::toolbar(Sequence& seq)
     if (ImGui::Button(playing ? "Pause" : "Play ")) seq.togglePlay();
     if (playing) ImGui::PopStyleColor();
     ImGui::SetItemTooltip("Play / Pause (Space)");
+    if (transportItemContextMenu) transportItemContextMenu("play");
     ImGui::SameLine();
 
     if (ImGui::Button("Stop")) seq.stop();
+    if (transportItemContextMenu) transportItemContextMenu("stop");
     ImGui::SameLine();
 
     ImGui::SetNextItemWidth(86);

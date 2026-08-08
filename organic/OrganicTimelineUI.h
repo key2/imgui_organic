@@ -8,6 +8,7 @@
 #pragma once
 
 #include "OrganicTimeline.h"
+#include <functional>
 #include <map>
 
 namespace organic
@@ -24,6 +25,12 @@ public:
 
     // Convenience: Begin/End a window and draw body().
     void gui(Sequence& seq, bool* open = nullptr, const char* windowName = "Timeline");
+
+    // Host hook: invoked right after each transport button item ("play",
+    // "stop") so the embedding app can attach its own context menu /
+    // extra affordances to the button (e.g. copy a remote-control
+    // address). The last ImGui item is the button when this runs.
+    std::function<void(const char* transportControl)> transportItemContextMenu;
 
     // options
     bool  snapEnabled  = true;
