@@ -476,6 +476,43 @@ ImVec4 light = colors->colorAt(seq.currentTime);
 `Sequence::save()/load()` round-trips the whole structure (used by the demo's
 project files).
 
+#### Embedded clip automations (Timeline v2)
+
+A **block clip can contain its own automations** — the block renders them as
+internal rows (compact named header with expand/collapse; a curve or gradient
+editor when open). Key times are **clip-local** (0 .. clip length), so the
+data moves with the clip, splits with it and can never extend beyond it:
+
+```cpp
+auto* fx  = static_cast<ClipLayer*>(seq.addLayer(Layer::LType::Clips, "FX"));
+Clip* eff = fx->addClip(Clip::CType::Block, "Wave", 2.0, 8.0);
+
+ClipAutomation* rate = eff->addAutomation(ClipAutomation::AKind::Curve,
+                                          "rate", /*host tag*/"1:rate");
+rate->rangeMin = 0.f; rate->rangeMax = 2.f;
+rate->addKey(0.0, 0.5f);                    // local: 0 = clip start
+rate->addKey(8.0, 2.0f, EasingType::Bezier);
+rate->expanded = true;                      // row opens in the editor
+
+ClipAutomation* col = eff->addAutomation(ClipAutomation::AKind::Gradient, "color");
+col->addGradKey(0.0, ImVec4(1, 0, 0, 1));
+col->addGradKey(8.0, ImVec4(0, 1, 0, 1));
+
+// drive your engine while the playhead is inside the block:
+double local = seq.currentTime - eff->start();
+float  r = rate->valueAt(local);
+ImVec4 c2 = col->colorAt(local);
+```
+
+Recording is host-fed: set `recArm`, call `updateRecording(localT, value)`
+per frame while playing, and `stopRecordingAndApply()` simplifies the take
+into keys (the row's record dot arms it from the UI). Two clips on one layer
+**never overlap** — interactive moves/resizes seat flush against neighbours,
+and `ClipLayer::resolveOverlap(t, len)` gives code the same nearest-free-spot
+answer. **Pencil mode** (`P` / toolbar) lets the user draw curves freehand
+across any automation editor; programmatically the same landing is
+`applyDrawnPoints(points, method, tolerance)`.
+
 ### 3.6 Drag & drop media
 
 Any ImGui drag source can create clips by carrying a `MediaPayload`:

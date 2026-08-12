@@ -60,14 +60,88 @@ struct Hit
     {
         None, Corner, Header, HeaderGrip, Lane, ClipBody, ClipL, ClipR,
         AKey, BezA1, BezA2, EaseHandle, GKey, TKey, FadeIn, FadeOut,
-        KeyBoxL, KeyBoxR, KeyBoxT, KeyBoxB, KeyBoxMove
+        KeyBoxL, KeyBoxR, KeyBoxT, KeyBoxB, KeyBoxMove,
+        // embedded clip-automation rows
+        CAHeader, CAArm, CAKey, CABezA1, CABezA2, CAEase, CAGKey,
+        CACurve, CAGrad
     };
     Kind   kind = None;
     Layer* layer = nullptr;
     int    laneIdx = -1;
     Clip*  clip = nullptr;
+    ClipAutomation* cauto = nullptr;
     uint64_t keyId = 0;
 };
+
+// ---------------------------------------------------------------- embedded automation rows
+// Layout of the rows INSIDE an effect block (Timeline v2): a compact header
+// per automation (expand triangle + name + live chip) and, when expanded,
+// the editor body (curve or gradient). All heights ride the row's smooth
+// open/close animation.
+static const float CA_TITLE_H = 19.f; // block title strip
+static const float CA_HEAD_H  = 16.f; // automation row header (collapsed height)
+static const float CA_CURVE_H = 52.f; // expanded curve editor
+static const float CA_GRAD_H  = 22.f; // expanded gradient editor
+
+static float caBodyH(const ClipAutomation& a)
+{
+    float target = a.akind == ClipAutomation::AKind::Gradient ? CA_GRAD_H : CA_CURVE_H;
+    float anim = a.uiAnim < 0 ? (a.expanded ? 1.f : 0.f) : a.uiAnim;
+    return anim * target;
+}
+
+static float caRowsHeight(const Clip& c)
+{
+    float h = 0;
+    for (auto& a : c.automations) h += CA_HEAD_H + caBodyH(*a) + 1.f;
+    return h;
+}
+
+// content height a Block clip wants (title + rows); clips without
+// automations keep the classic full-lane look
+static float clipDesiredH(const Clip& c)
+{
+    if (c.ctype != Clip::CType::Block || c.automations.empty()) return 0;
+    return CA_TITLE_H + caRowsHeight(c) + 4.f;
+}
+
+struct AutoRowGeom
+{
+    ClipAutomation* a = nullptr;
+    float hy0 = 0, hy1 = 0; // header strip
+    float by0 = 0, by1 = 0; // editor body (by1 == by0 when collapsed)
+};
+
+// rows laid out under the block's title strip; blockY0 = clip rect top
+static void buildAutoRows(Clip& c, float blockY0, std::vector<AutoRowGeom>& out)
+{
+    out.clear();
+    float y = blockY0 + CA_TITLE_H;
+    for (auto& a : c.automations)
+    {
+        AutoRowGeom g;
+        g.a = a.get();
+        g.hy0 = y;
+        g.hy1 = y + CA_HEAD_H;
+        g.by0 = g.hy1;
+        g.by1 = g.hy1 + caBodyH(*a);
+        out.push_back(g);
+        y = g.by1 + 1.f;
+    }
+}
+
+static float caRowNormToY(const AutoRowGeom& rg, float norm)
+{
+    float h = (rg.by1 - rg.by0) - 8.f;
+    return rg.by1 - 4.f - norm * std::max(0.f, h);
+}
+static float caRowYToNorm(const AutoRowGeom& rg, float y)
+{
+    float h = (rg.by1 - rg.by0) - 8.f;
+    if (h <= 0) return 0;
+    float n = (rg.by1 - 4.f - y) / h;
+    return std::max(0.f, std::min(1.f, n));
+}
 
 static float normToY(const LaneGeom& g, float norm)
 {
@@ -154,6 +228,39 @@ static json layerKeysJson(Layer* l)
     if (auto* gl = dynamic_cast<GradientLayer*>(l)) return gl->keysToJson();
     if (auto* tl = dynamic_cast<TriggerLayer*>(l)) return tl->keysToJson();
     return json();
+}
+
+// key edits inside an embedded clip automation
+static void pushClipAutoKeysEdit(Sequence* seq, uint64_t clipId, uint64_t autoId,
+                                 const json& pre, const json& post, const std::string& name)
+{
+    if (pre == post) return;
+    auto apply = [seq, clipId, autoId](const json& data)
+    {
+        if (Clip* c = seq->findClip(clipId))
+            if (ClipAutomation* a = c->findAutomation(autoId))
+                a->keysFromJson(data);
+    };
+    UndoManager::get().pushDone(name,
+        [apply, post] { apply(post); },
+        [apply, pre]  { apply(pre); },
+        { seq });
+}
+
+// whole-clip edits (resize gestures that also trim embedded automations):
+// restore the full clip json in place — identity (pointer/id) is preserved
+static void pushClipEdit(Sequence* seq, uint64_t clipId,
+                         const json& pre, const json& post, const std::string& name)
+{
+    if (pre == post) return;
+    auto apply = [seq, clipId](const json& data)
+    {
+        if (Clip* c = seq->findClip(clipId)) c->load(data);
+    };
+    UndoManager::get().pushDone(name,
+        [apply, post] { apply(post); },
+        [apply, pre]  { apply(pre); },
+        { seq });
 }
 
 static void pushCuesEdit(Sequence* seq, const json& pre, const std::string& name)
@@ -321,11 +428,7 @@ void TimelineUI::toolbar(Sequence& seq)
     ImGui::SameLine();
     ImGui::Checkbox("Follow", &followPlayhead);
 
-    ImGui::SameLine();
-    if (ImGui::Button("Fit")) fitRequested = true;
-    ImGui::SetItemTooltip("Fit content in view (F)");
-
-    ImGui::SameLine();
+    ImGui::SameLine(0, 14);
     if (ImGui::Button("+ Layer")) ImGui::OpenPopup("add_layer_toolbar");
     if (ImGui::BeginPopup("add_layer_toolbar"))
     {
@@ -342,16 +445,45 @@ void TimelineUI::toolbar(Sequence& seq)
                 { sp });
             l->select();
         };
-        if (ImGui::MenuItem("Clip Layer"))       addL(Layer::LType::Clips, "Clips");
-        if (ImGui::MenuItem("Automation Layer")) addL(Layer::LType::Automation, "Automation");
-        if (ImGui::MenuItem("Gradient Layer"))   addL(Layer::LType::Gradient, "Gradient");
-        if (ImGui::MenuItem("Trigger Layer"))    addL(Layer::LType::Triggers, "Triggers");
+        if (offerClipLayers && ImGui::MenuItem("Clip Layer"))
+            addL(Layer::LType::Clips, "Clips");
+        if (offerAutomationLayers && ImGui::MenuItem("Automation Layer"))
+            addL(Layer::LType::Automation, "Automation");
+        if (offerGradientLayers && ImGui::MenuItem("Gradient Layer"))
+            addL(Layer::LType::Gradient, "Gradient");
+        if (offerTriggerLayers && ImGui::MenuItem("Trigger Layer"))
+            addL(Layer::LType::Triggers, "Triggers");
         ImGui::EndPopup();
     }
 
     ImGui::SameLine();
     if (ImGui::Button("Sequence")) seq.select();
     ImGui::SetItemTooltip("Edit sequence settings in the Inspector");
+
+    // zoom cluster, right-aligned: zoom out / 1:1 / zoom in / fit content
+    // (F and Ctrl+wheel still work)
+    {
+        const ImGuiStyle& st = ImGui::GetStyle();
+        auto bw = [&](const char* s)
+        { return ImGui::CalcTextSize(s).x + st.FramePadding.x * 2; };
+        const float cluster = bw(zoomOutLabel) + bw(zoomOneLabel) + bw(zoomInLabel) +
+                              bw(zoomFitLabel) + st.ItemSpacing.x * 3;
+        ImGui::SameLine();
+        const float rightX = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x;
+        if (rightX - cluster > ImGui::GetCursorPosX())
+            ImGui::SetCursorPosX(rightX - cluster);
+        if (ImGui::Button(zoomOutLabel)) zoomRequest--;
+        ImGui::SetItemTooltip("Zoom out (Ctrl+wheel)");
+        ImGui::SameLine();
+        if (ImGui::Button(zoomOneLabel)) zoomOneRequested = true;
+        ImGui::SetItemTooltip("Zoom 1:1 (default scale)");
+        ImGui::SameLine();
+        if (ImGui::Button(zoomInLabel)) zoomRequest++;
+        ImGui::SetItemTooltip("Zoom in (Ctrl+wheel)");
+        ImGui::SameLine();
+        if (ImGui::Button(zoomFitLabel)) fitRequested = true;
+        ImGui::SetItemTooltip("Fit content in view (F)");
+    }
 }
 
 void TimelineUI::gui(Sequence& seq, bool* open, const char* windowName)
@@ -408,6 +540,17 @@ void TimelineUI::body(Sequence& seq)
         fitRequested = false;
         viewStart = 0;
         pps = std::max(2.0, std::min(4000.0, laneW / std::max(1.0, contentEnd * 1.02)));
+    }
+    if (zoomRequest != 0 || zoomOneRequested)
+    {
+        // toolbar zoom: keep the CENTER of the view anchored so the
+        // material under the eye stays put while the scale changes
+        const double center = viewStart + laneW * 0.5 / pps;
+        if (zoomOneRequested) pps = 80.0; // 1:1 = the model's default scale
+        else pps = std::max(2.0, std::min(4000.0, pps * std::pow(1.45, (double)zoomRequest)));
+        viewStart = std::max(0.0, center - laneW * 0.5 / pps);
+        zoomRequest = 0;
+        zoomOneRequested = false;
     }
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -680,8 +823,47 @@ void TimelineUI::body(Sequence& seq)
                       ImGuiWindowFlags_NoScrollWithMouse);
     ImDrawList* cdl = ImGui::GetWindowDrawList();
 
-    float contentH = LANE_GAP;
-    for (auto& l : seq.layers) contentH += l->uiHeight + LANE_GAP;
+    // advance the embedded automation open/close animations (smooth expand:
+    // block AND track heights follow the eased value below)
+    for (auto& l : seq.layers)
+        if (auto* cl0 = dynamic_cast<ClipLayer*>(l.get()))
+            for (auto& c : cl0->clips)
+                for (auto& a : c->automations)
+                {
+                    float target = a->expanded ? 1.f : 0.f;
+                    if (a->uiAnim < 0) a->uiAnim = target; // first sight: no anim
+                    else
+                    {
+                        a->uiAnim += (target - a->uiAnim) *
+                                     std::min(1.f, io.DeltaTime * 14.f);
+                        if (std::fabs(a->uiAnim - target) < 0.01f) a->uiAnim = target;
+                    }
+                }
+
+    // effective lane height: clip tracks auto-grow so the tallest block
+    // (title + expanded automation rows) always fits; the header grip still
+    // sets the BASE height
+    auto laneH = [](Layer* l) -> float
+    {
+        float h = l->uiHeight;
+        if (auto* cl = dynamic_cast<ClipLayer*>(l))
+            for (auto& c : cl->clips)
+            {
+                float want = clipDesiredH(*c);
+                if (want > 0) h = std::max(h, want + 6.f);
+            }
+        return h;
+    };
+
+    // sticky layer (the pinned audio/waveform lane): rendered at a FIXED
+    // position under the ruler, outside the scroll flow — always visible
+    Layer* stickyL = stickyLayerId ? seq.findLayer(stickyLayerId) : nullptr;
+    const float winTop = ImGui::GetWindowPos().y;
+    const float stickyBandH = stickyL ? laneH(stickyL) + LANE_GAP : 0.f;
+
+    float contentH = LANE_GAP + stickyBandH;
+    for (auto& l : seq.layers)
+        if (l.get() != stickyL) contentH += laneH(l.get()) + LANE_GAP;
     contentH += 70;
 
     float canvasW = avail.x;
@@ -695,22 +877,55 @@ void TimelineUI::body(Sequence& seq)
     float cLaneX0 = canvasP0.x + HEADER_W;
     float cLaneX1 = canvasP0.x + canvasW;
 
-    // geometry
+    // geometry: flow lanes scroll (starting below the sticky band); the
+    // sticky lane's geom is pinned to the visible top and pushed LAST so
+    // it draws on top of anything scrolling beneath it
     std::vector<LaneGeom> geoms;
+    float flowBottom = canvasP0.y + LANE_GAP + stickyBandH;
     {
-        float y = canvasP0.y + LANE_GAP;
+        float y = flowBottom;
         int idx = 0;
         for (auto& l : seq.layers)
         {
-            LaneGeom g; g.layer = l.get(); g.index = idx++;
-            g.y0 = y; g.y1 = y + l->uiHeight;
+            const int myIdx = idx++;
+            if (l.get() == stickyL) continue;
+            LaneGeom g; g.layer = l.get(); g.index = myIdx;
+            g.y0 = y; g.y1 = y + laneH(l.get());
             geoms.push_back(g);
             y = g.y1 + LANE_GAP;
         }
+        flowBottom = y;
+        if (stickyL)
+        {
+            LaneGeom g; g.layer = stickyL; g.index = seq.layerIndex(stickyL);
+            g.y0 = winTop + 1;
+            g.y1 = g.y0 + laneH(stickyL);
+            geoms.push_back(g);
+        }
     }
+    // a Block clip with automations draws at its OWN height (compact when
+    // its rows are collapsed) — the shared vertical extent for hit tests
+    // and drawing
+    auto clipRectY = [&](const LaneGeom& g, const Clip& c, float& y0, float& y1)
+    {
+        y0 = g.y0 + 3;
+        y1 = g.y1 - 3;
+        float want = clipDesiredH(c);
+        if (want > 0) y1 = std::min(y1, y0 + want);
+    };
     auto laneAtY = [&](float y) -> const LaneGeom*
     {
-        for (auto& g : geoms) if (y >= g.y0 && y < g.y1 + LANE_GAP) return &g;
+        // the pinned lane overlays the flow — it owns its band exclusively
+        if (stickyL && !geoms.empty() && geoms.back().layer == stickyL)
+        {
+            const LaneGeom& sg = geoms.back();
+            if (y >= sg.y0 && y < sg.y1 + LANE_GAP) return &sg;
+        }
+        for (auto& g : geoms)
+        {
+            if (g.layer == stickyL) continue;
+            if (y >= g.y0 && y < g.y1 + LANE_GAP) return &g;
+        }
         return nullptr;
     };
     auto geomOf = [&](const Layer* l) -> const LaneGeom*
@@ -789,7 +1004,9 @@ void TimelineUI::body(Sequence& seq)
                         Clip* c = cl->clips[i].get();
                         float x0 = timeToX(c->start());
                         float x1 = timeToX(c->end());
-                        if (mouse.x >= x0 - 1 && mouse.x < x1 + 1 && mouse.y >= g->y0 && mouse.y < g->y1)
+                        float cy0, cy1;
+                        clipRectY(*g, *c, cy0, cy1);
+                        if (mouse.x >= x0 - 1 && mouse.x < x1 + 1 && mouse.y >= cy0 - 3 && mouse.y < cy1 + 1)
                         {
                             // fade handles (audio, selected clip only to reduce clutter)
                             if (c->ctype == Clip::CType::Audio && c->isSelected())
@@ -804,6 +1021,74 @@ void TimelineUI::body(Sequence& seq)
                             else if (mouse.x > x1 - edge)  hit.kind = Hit::ClipR;
                             else                           hit.kind = Hit::ClipBody;
                             hit.clip = c;
+
+                            // embedded automation rows (Block clips)
+                            if (hit.kind == Hit::ClipBody && !c->automations.empty() &&
+                                c->ctype == Clip::CType::Block)
+                            {
+                                std::vector<AutoRowGeom> rows;
+                                buildAutoRows(*c, cy0, rows);
+                                for (auto& rg : rows)
+                                {
+                                    ClipAutomation* a = rg.a;
+                                    if (mouse.y >= rg.hy0 && mouse.y < rg.hy1)
+                                    {
+                                        // record dot on the right of the header
+                                        ImVec2 dot(x1 - 10.f, (rg.hy0 + rg.hy1) * 0.5f);
+                                        hit.kind = dist2(mouse, dot) < 30 ? Hit::CAArm
+                                                                          : Hit::CAHeader;
+                                        hit.cauto = a;
+                                        break;
+                                    }
+                                    if (mouse.y >= rg.by0 && mouse.y < rg.by1 && rg.by1 > rg.by0 + 4)
+                                    {
+                                        hit.cauto = a;
+                                        if (a->akind == ClipAutomation::AKind::Gradient)
+                                        {
+                                            hit.kind = Hit::CAGrad;
+                                            for (auto& k : a->gkeys)
+                                            {
+                                                ImVec2 kp(x0 + (float)(k.time * pps), rg.by1 - 6.f);
+                                                if (dist2(mouse, kp) < 42) { hit.kind = Hit::CAGKey; hit.keyId = k.id; break; }
+                                            }
+                                            break;
+                                        }
+                                        hit.kind = Hit::CACurve;
+                                        float rmn = a->rangeMin, rmx = a->rangeMax;
+                                        float rr = (rmx - rmn) == 0 ? 1.f : (rmx - rmn);
+                                        // bezier / ease handles of selected keys first
+                                        for (size_t ki = 0; ki + 1 < a->keys.size() && hit.kind == Hit::CACurve; ki++)
+                                        {
+                                            AutoKey& k = a->keys[ki];
+                                            if (!a->selectedKeys.count(k.id)) continue;
+                                            AutoKey& nk = a->keys[ki + 1];
+                                            double segDur = nk.time - k.time;
+                                            float na = (k.value - rmn) / rr, nb = (nk.value - rmn) / rr;
+                                            if (k.easing == EasingType::Bezier)
+                                            {
+                                                ImVec2 h1(x0 + (float)((k.time + k.ep.a1.x * segDur) * pps), caRowNormToY(rg, na + k.ep.a1.y));
+                                                ImVec2 h2(x0 + (float)((nk.time + k.ep.a2.x * segDur) * pps), caRowNormToY(rg, nb + k.ep.a2.y));
+                                                if (dist2(mouse, h1) < 42) { hit.kind = Hit::CABezA1; hit.keyId = k.id; }
+                                                else if (dist2(mouse, h2) < 42) { hit.kind = Hit::CABezA2; hit.keyId = k.id; }
+                                            }
+                                            else if (easingHasHandle(k.easing))
+                                            {
+                                                double midT = (k.time + nk.time) * 0.5;
+                                                float midV = ease(k.easing, na, nb, 0.5f, k.ep);
+                                                ImVec2 hm(x0 + (float)(midT * pps), caRowNormToY(rg, midV));
+                                                if (dist2(mouse, hm) < 36) { hit.kind = Hit::CAEase; hit.keyId = k.id; }
+                                            }
+                                        }
+                                        if (hit.kind == Hit::CACurve)
+                                            for (auto& k : a->keys)
+                                            {
+                                                ImVec2 kp(x0 + (float)(k.time * pps), caRowNormToY(rg, (k.value - rmn) / rr));
+                                                if (dist2(mouse, kp) < 42) { hit.kind = Hit::CAKey; hit.keyId = k.id; break; }
+                                            }
+                                        break;
+                                    }
+                                }
+                            }
                             break;
                         }
                     }
@@ -880,6 +1165,11 @@ void TimelineUI::body(Sequence& seq)
     if (hit.kind == Hit::HeaderGrip || drag == Drag::LayerHeight ||
         hit.kind == Hit::KeyBoxT || hit.kind == Hit::KeyBoxB)
         ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+    if (hit.kind == Hit::CAHeader || hit.kind == Hit::CAArm)
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    if (pencilMode && (hit.kind == Hit::CACurve ||
+                       (hit.kind == Hit::Lane && dynamic_cast<AutomationLayer*>(hit.layer))))
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
 
     // ============================================================ OPERATION HELPERS
     auto deleteSelection = [&]()
@@ -889,6 +1179,29 @@ void TimelineUI::body(Sequence& seq)
         for (Clip* c : Selection::get().getAs<Clip>())
             if (c->layer && c->layer->sequence == sp)
                 clipRecs.push_back({ c->layer->id, c->save() });
+
+        // selected keys inside embedded clip automations
+        struct CARec { uint64_t clip, cauto; json pre, post; };
+        std::vector<CARec> caRecs;
+        bool clipDeleted = !clipRecs.empty();
+        for (auto& l : seq.layers)
+        {
+            auto* cl = dynamic_cast<ClipLayer*>(l.get());
+            if (!cl) continue;
+            for (auto& c : cl->clips)
+            {
+                if (clipDeleted && c->isSelected()) continue; // dies whole
+                for (auto& a : c->automations)
+                {
+                    if (a->selectedKeys.empty()) continue;
+                    json pre = a->keysToJson();
+                    for (uint64_t kid : std::vector<uint64_t>(a->selectedKeys.begin(),
+                                                              a->selectedKeys.end()))
+                        a->removeKey(kid);
+                    caRecs.push_back({ c->id, a->id, pre, a->keysToJson() });
+                }
+            }
+        }
 
         struct KeyRec { uint64_t layer; json pre, post; };
         std::vector<KeyRec> keyRecs;
@@ -923,9 +1236,16 @@ void TimelineUI::body(Sequence& seq)
             if (auto* cl = dynamic_cast<ClipLayer*>(seq.findLayer(r.layer)))
                 cl->removeClip(r.data.value("id", (uint64_t)0));
 
-        if (clipRecs.empty() && keyRecs.empty()) return;
+        if (clipRecs.empty() && keyRecs.empty() && caRecs.empty()) return;
+        auto applyCa = [sp](const std::vector<CARec>& recs, bool post)
+        {
+            for (auto& r : recs)
+                if (Clip* c = sp->findClip(r.clip))
+                    if (ClipAutomation* a = c->findAutomation(r.cauto))
+                        a->keysFromJson(post ? r.post : r.pre);
+        };
         UndoManager::get().pushDone("Delete",
-            [sp, clipRecs, keyRecs]
+            [sp, clipRecs, keyRecs, caRecs, applyCa]
             {
                 for (auto& r : clipRecs)
                     if (auto* cl = dynamic_cast<ClipLayer*>(sp->findLayer(r.layer)))
@@ -937,8 +1257,9 @@ void TimelineUI::body(Sequence& seq)
                     else if (auto* gl = dynamic_cast<GradientLayer*>(l)) gl->keysFromJson(r.post);
                     else if (auto* tl = dynamic_cast<TriggerLayer*>(l)) tl->keysFromJson(r.post);
                 }
+                applyCa(caRecs, true);
             },
-            [sp, clipRecs, keyRecs]
+            [sp, clipRecs, keyRecs, caRecs, applyCa]
             {
                 for (auto& r : clipRecs)
                     if (auto* cl = dynamic_cast<ClipLayer*>(sp->findLayer(r.layer)))
@@ -950,6 +1271,7 @@ void TimelineUI::body(Sequence& seq)
                     else if (auto* gl = dynamic_cast<GradientLayer*>(l)) gl->keysFromJson(r.pre);
                     else if (auto* tl = dynamic_cast<TriggerLayer*>(l)) tl->keysFromJson(r.pre);
                 }
+                applyCa(caRecs, false);
             },
             { sp });
     };
@@ -967,7 +1289,8 @@ void TimelineUI::body(Sequence& seq)
         {
             json j = c->save();
             j["id"] = seq.newId();
-            j["params"]["start"] = (float)c->end();
+            // land the copy in the nearest free spot (blocks never stack)
+            j["params"]["start"] = (float)c->layer->resolveOverlap(c->end(), c->length());
             Clip* nc = c->layer->addClipFromJson(j);
             Selection::get().add(nc);
             recs.push_back({ c->layer->id, j });
@@ -1036,6 +1359,31 @@ void TimelineUI::body(Sequence& seq)
         if (b["params"].contains("offset"))
             b["params"]["offset"] = (float)(c->offsetP->floatValue() + cut);
         if (b["params"].contains("fadeIn")) b["params"]["fadeIn"] = 0.f;
+
+        // embedded automations split with the block: the head keeps keys
+        // before the cut, the tail's keys shift into its own local time
+        auto splitAutos = [cut](json& half, bool head)
+        {
+            if (!half.contains("autos")) return;
+            for (auto& aj : half["autos"])
+            {
+                if (!aj.contains("keys") || !aj["keys"].is_array()) continue;
+                json kept = json::array();
+                for (auto kj : aj["keys"])
+                {
+                    double kt = kj.value("t", 0.0);
+                    if (head) { if (kt <= cut + 1e-9) kept.push_back(kj); }
+                    else if (kt >= cut - 1e-9)
+                    {
+                        kj["t"] = kt - cut;
+                        kept.push_back(kj);
+                    }
+                }
+                aj["keys"] = kept;
+            }
+        };
+        splitAutos(a, true);
+        splitAutos(b, false);
 
         uint64_t origId = c->id;
         cl->removeClip(origId);
@@ -1135,7 +1483,9 @@ void TimelineUI::body(Sequence& seq)
                 if (!cl) return;
                 json data = e["data"];
                 data["id"] = seq.newId();
-                data["params"]["start"] = (float)(data["params"].value("start", 0.f) - anchor + at);
+                const double wantT = data["params"].value("start", 0.f) - anchor + at;
+                const double wantLen = data["params"].value("length", 4.f);
+                data["params"]["start"] = (float)cl->resolveOverlap(wantT, wantLen);
                 Clip* nc = cl->addClipFromJson(data);
                 if (nc) Selection::get().add(nc);
                 recs.push_back({ cl->id, data });
@@ -1248,9 +1598,10 @@ void TimelineUI::body(Sequence& seq)
 
     auto createClipFromPayload = [&](ClipLayer* cl, double t, const MediaPayload& mp)
     {
+        const double len = mp.duration > 0 ? mp.duration : 2.0;
+        t = cl->resolveOverlap(t, len); // blocks never stack on one track
         Clip* c = cl->addClip(mp.kind == 1 ? Clip::CType::Audio : Clip::CType::Block,
-                              mp.name[0] ? mp.name : "Clip", t,
-                              mp.duration > 0 ? mp.duration : 2.0);
+                              mp.name[0] ? mp.name : "Clip", t, len);
         ImVec4 col(mp.color[0], mp.color[1], mp.color[2], mp.color[3]);
         c->colorP->setValue(col, false);
         c->colorP->defaultValue = col;
@@ -1328,11 +1679,14 @@ void TimelineUI::body(Sequence& seq)
             hit.layer->select(io.KeyCtrl);
             if (dbl)
             {
-                ctxLayerId = hit.layer->id;
-                snprintf(renameBuf, sizeof(renameBuf), "%s", hit.layer->niceName.c_str());
-                wantRenamePopup = true;
+                if (offerLayerRename)
+                {
+                    ctxLayerId = hit.layer->id;
+                    snprintf(renameBuf, sizeof(renameBuf), "%s", hit.layer->niceName.c_str());
+                    wantRenamePopup = true;
+                }
             }
-            else
+            else if (hit.layer->id != stickyLayerId) // the pinned lane stays put
             {
                 // possible drag-reorder (engages after threshold)
                 drag = Drag::LayerReorder;
@@ -1359,7 +1713,14 @@ void TimelineUI::body(Sequence& seq)
         }
         case Hit::ClipBody:
         {
-            if (dbl) { hit.clip->select(); break; }
+            if (dbl)
+            {
+                hit.clip->select();
+                // host hook: open/edit what the block references (e.g. the
+                // effect graph in the app's node editor)
+                if (clipDoubleClicked) clipDoubleClicked(*hit.clip);
+                break;
+            }
             bool wasSelected = hit.clip->isSelected();
             if (io.KeyCtrl) { Selection::get().toggle(hit.clip); }
             else if (!wasSelected) { Selection::get().set(hit.clip); }
@@ -1385,6 +1746,159 @@ void TimelineUI::body(Sequence& seq)
             dragOrigA = hit.clip->start();
             dragOrigB = hit.clip->length();
             dragOrigC = hit.clip->ctype == Clip::CType::Audio ? hit.clip->offsetP->floatValue() : 0.0;
+            dragClipPre = hit.clip->save(); // automations may get trimmed
+            break;
+        }
+        case Hit::CAHeader:
+        {
+            // expand / collapse the automation row (smooth: uiAnim eases,
+            // block + track heights follow)
+            hit.cauto->expanded = !hit.cauto->expanded;
+            hit.clip->select();
+            break;
+        }
+        case Hit::CAArm:
+        {
+            hit.cauto->recArm = !hit.cauto->recArm;
+            if (!hit.cauto->recArm && hit.cauto->recording)
+                hit.cauto->stopRecordingAndApply();
+            hit.clip->select();
+            break;
+        }
+        case Hit::CAKey:
+        {
+            ClipAutomation* a = hit.cauto;
+            if (io.KeyCtrl)
+            {
+                if (a->selectedKeys.count(hit.keyId)) a->selectedKeys.erase(hit.keyId);
+                else a->selectedKeys.insert(hit.keyId);
+            }
+            else if (!a->selectedKeys.count(hit.keyId))
+            {
+                a->selectedKeys.clear();
+                a->selectedKeys.insert(hit.keyId);
+            }
+            hit.clip->select();
+            if (!a->selectedKeys.count(hit.keyId)) break;
+            drag = Drag::CAKey;
+            dragLayerId = hit.layer->id;
+            dragClipId = hit.clip->id;
+            dragAutoId = a->id;
+            dragItemId = hit.keyId;
+            preEditJson = a->keysToJson();
+            break;
+        }
+        case Hit::CABezA1:
+        case Hit::CABezA2:
+        {
+            drag = hit.kind == Hit::CABezA1 ? Drag::CABez1 : Drag::CABez2;
+            dragLayerId = hit.layer->id;
+            dragClipId = hit.clip->id;
+            dragAutoId = hit.cauto->id;
+            dragItemId = hit.keyId;
+            preEditJson = hit.cauto->keysToJson();
+            break;
+        }
+        case Hit::CAEase:
+        {
+            drag = Drag::CAEase;
+            dragLayerId = hit.layer->id;
+            dragClipId = hit.clip->id;
+            dragAutoId = hit.cauto->id;
+            dragItemId = hit.keyId;
+            preEditJson = hit.cauto->keysToJson();
+            if (AutoKey* k = hit.cauto->findKey(hit.keyId))
+            {
+                dragOrigA = k->ep.freq;
+                dragOrigB = k->ep.amp;
+                dragOrigC = (double)k->ep.steps;
+            }
+            break;
+        }
+        case Hit::CAGKey:
+        {
+            ClipAutomation* a = hit.cauto;
+            if (io.KeyCtrl)
+            {
+                if (a->selectedKeys.count(hit.keyId)) a->selectedKeys.erase(hit.keyId);
+                else a->selectedKeys.insert(hit.keyId);
+            }
+            else if (!a->selectedKeys.count(hit.keyId))
+            {
+                a->selectedKeys.clear();
+                a->selectedKeys.insert(hit.keyId);
+            }
+            hit.clip->select();
+            if (!a->selectedKeys.count(hit.keyId)) break;
+            drag = Drag::CAGKey;
+            dragLayerId = hit.layer->id;
+            dragClipId = hit.clip->id;
+            dragAutoId = a->id;
+            dragItemId = hit.keyId;
+            preEditJson = a->keysToJson();
+            break;
+        }
+        case Hit::CACurve:
+        {
+            ClipAutomation* a = hit.cauto;
+            double localT = std::max(0.0, std::min(hit.clip->length(),
+                                                   xToTime(mouse.x) - hit.clip->start()));
+            if (dbl && !pencilMode)
+            {
+                // double-click adds a key (curve-shape preserving)
+                json pre = a->keysToJson();
+                AutoKey* k = nullptr;
+                if (a->keys.size() >= 2 && localT > a->keys.front().time &&
+                    localT < a->keys.back().time)
+                    k = a->insertKeyAt(localT);
+                else
+                {
+                    std::vector<AutoRowGeom> rows;
+                    float cy0, cy1;
+                    const LaneGeom* g = geomOf(hit.layer);
+                    clipRectY(*g, *hit.clip, cy0, cy1);
+                    buildAutoRows(*hit.clip, cy0, rows);
+                    float nv = 0.5f;
+                    for (auto& rg : rows)
+                        if (rg.a == a) nv = caRowYToNorm(rg, mouse.y);
+                    k = a->addKey(localT, a->rangeMin + nv * (a->rangeMax - a->rangeMin));
+                }
+                a->selectedKeys.clear();
+                a->selectedKeys.insert(k->id);
+                hit.clip->select();
+                pushClipAutoKeysEdit(sp, hit.clip->id, a->id, pre, a->keysToJson(), "Add Key");
+                break;
+            }
+            if (pencilMode)
+            {
+                // pencil: draw the curve freehand across the editor
+                drag = Drag::PencilClip;
+                dragLayerId = hit.layer->id;
+                dragClipId = hit.clip->id;
+                dragAutoId = a->id;
+                preEditJson = a->keysToJson();
+                pencilPts.clear();
+                break;
+            }
+            hit.clip->select();
+            break;
+        }
+        case Hit::CAGrad:
+        {
+            ClipAutomation* a = hit.cauto;
+            double localT = std::max(0.0, std::min(hit.clip->length(),
+                                                   xToTime(mouse.x) - hit.clip->start()));
+            if (dbl)
+            {
+                json pre = a->keysToJson();
+                GradKey* k = a->addGradKey(localT, a->colorAt(localT));
+                a->selectedKeys.clear();
+                a->selectedKeys.insert(k->id);
+                hit.clip->select();
+                pushClipAutoKeysEdit(sp, hit.clip->id, a->id, pre, a->keysToJson(), "Add Color Key");
+                break;
+            }
+            hit.clip->select();
             break;
         }
         case Hit::AKey:
@@ -1485,7 +1999,9 @@ void TimelineUI::body(Sequence& seq)
                 if (auto* cl = dynamic_cast<ClipLayer*>(hit.layer))
                 {
                     double len = std::max(snapStep(seq, pps) * 4.0, 1.0);
-                    Clip* c = cl->addClip(Clip::CType::Block, "Clip", t, len);
+                    // blocks never stack: land in the nearest free spot
+                    Clip* c = cl->addClip(Clip::CType::Block, "Clip",
+                                          cl->resolveOverlap(t, len), len);
                     pushClipAdded(sp, cl->id, c->save(), "Add Clip");
                     c->select();
                 }
@@ -1526,6 +2042,17 @@ void TimelineUI::body(Sequence& seq)
                 }
                 break;
             }
+            // pencil mode draws on automation lanes too
+            if (pencilMode && dynamic_cast<AutomationLayer*>(hit.layer))
+            {
+                auto* al = static_cast<AutomationLayer*>(hit.layer);
+                drag = Drag::PencilLane;
+                dragLayerId = al->id;
+                preEditJson = al->keysToJson();
+                pencilPts.clear();
+                al->select();
+                break;
+            }
             // rubber band start
             drag = Drag::Rubber;
             rubberStart = mouse;
@@ -1549,6 +2076,9 @@ void TimelineUI::body(Sequence& seq)
                     if (auto* al = dynamic_cast<AutomationLayer*>(l.get())) al->selectedKeys.clear();
                     else if (auto* gl = dynamic_cast<GradientLayer*>(l.get())) gl->selectedKeys.clear();
                     else if (auto* tl = dynamic_cast<TriggerLayer*>(l.get())) tl->selectedKeys.clear();
+                    if (auto* cl2 = dynamic_cast<ClipLayer*>(l.get()))
+                        for (auto& c : cl2->clips)
+                            for (auto& a : c->automations) a->selectedKeys.clear();
                 }
             }
             break;
@@ -1605,12 +2135,36 @@ void TimelineUI::body(Sequence& seq)
                 double delta = target - grabRef->start;
                 for (auto& r : dragClips)
                     delta = std::max(delta, -r.start);
+
+                // blocks on one track never overlap in time (conflicting
+                // effects): clamp the common delta so every dragged clip
+                // lands flush against its neighbours instead of on top
+                std::vector<uint64_t> draggedIds;
+                for (auto& r : dragClips) draggedIds.push_back(r.clip);
+                for (auto& r : dragClips)
+                {
+                    ClipLayer* owner = nullptr;
+                    Clip* c = seq.findClip(r.clip, &owner);
+                    if (!c || !owner) continue;
+                    const double len = c->length();
+                    for (auto& o : owner->clips)
+                    {
+                        bool isDragged = false;
+                        for (uint64_t idd : draggedIds) if (idd == o->id) isDragged = true;
+                        if (isDragged) continue;
+                        if (o->start() >= r.start + len - 1e-9)      // ahead
+                            delta = std::min(delta, o->start() - (r.start + len));
+                        else if (o->end() <= r.start + 1e-9)         // behind
+                            delta = std::max(delta, o->end() - r.start);
+                    }
+                }
+
                 for (auto& r : dragClips)
                     if (Clip* c = seq.findClip(r.clip))
                         c->startP->setValue((float)(r.start + delta));
 
                 const LaneGeom* tg = laneAtY(mouse.y);
-                if (tg && dynamic_cast<ClipLayer*>(tg->layer))
+                if (tg && tg->layer != stickyL && dynamic_cast<ClipLayer*>(tg->layer))
                 {
                     Clip* grabbed = seq.findClip(dragItemId);
                     int curIdx = grabbed ? seq.layerIndex(grabbed->layer) : -1;
@@ -1624,7 +2178,11 @@ void TimelineUI::body(Sequence& seq)
                             if (!c) { ok = false; break; }
                             int ni = seq.layerIndex(c->layer) + lDelta;
                             if (ni < 0 || ni >= (int)seq.layers.size() ||
+                                seq.layers[ni]->id == stickyLayerId || // audio lane: no effects
                                 !dynamic_cast<ClipLayer*>(seq.layers[ni].get())) { ok = false; break; }
+                            // target track must have room — no overlaps
+                            auto* tcl = static_cast<ClipLayer*>(seq.layers[ni].get());
+                            if (!tcl->spanFree(c->start(), c->end(), draggedIds)) { ok = false; break; }
                         }
                         if (ok)
                         {
@@ -1637,6 +2195,12 @@ void TimelineUI::body(Sequence& seq)
                         }
                     }
                 }
+                // dragging a clip BELOW the last layer: releasing there
+                // creates a fresh layer for it — no way otherwise to stack
+                // a second effect under the first without pre-creating the
+                // track by hand
+                dragBelowLanes = !tg && mouse.y >= flowBottom - LANE_GAP &&
+                                 mouse.x > cLaneX0;
                 break;
             }
             case Drag::ResizeL:
@@ -1652,11 +2216,33 @@ void TimelineUI::body(Sequence& seq)
                 }
                 t = std::min(t, dragOrigA + dragOrigB - 0.05);
                 t = std::max(0.0, t);
+                // stop flush against the previous block on this track
+                if (c->layer)
+                    for (auto& o : c->layer->clips)
+                        if (o->id != c->id && o->end() <= dragOrigA + 1e-9)
+                            t = std::max(t, o->end());
                 double d = t - dragOrigA;
                 c->startP->setValue((float)t);
                 c->lengthP->setValue((float)(dragOrigB - d));
                 if (c->ctype == Clip::CType::Audio)
                     c->offsetP->setValue((float)std::max(0.0, dragOrigC + d));
+                // embedded automations stay glued to the timeline while the
+                // left edge trims: locals shift by -d (restored from the
+                // drag-start snapshot each frame — no cumulative drift)
+                if (c->ctype == Clip::CType::Block && !c->automations.empty() &&
+                    dragClipPre.contains("autos"))
+                {
+                    size_t ai = 0;
+                    for (auto& a : c->automations)
+                    {
+                        if (ai >= dragClipPre["autos"].size()) break;
+                        const json& aj = dragClipPre["autos"][ai++];
+                        if (aj.contains("keys")) a->keysFromJson(aj["keys"]);
+                        for (auto& k : a->keys)  k.time -= d;
+                        for (auto& k : a->gkeys) k.time -= d;
+                        a->sortKeys();
+                    }
+                }
                 break;
             }
             case Drag::ResizeR:
@@ -1670,6 +2256,11 @@ void TimelineUI::body(Sequence& seq)
                     double m = magnetTime(seq, xToTime(mouse.x), pps, { c->id }, sn);
                     if (sn) { t = m; magnetGuides.push_back(m); }
                 }
+                // stop flush against the next block on this track
+                if (c->layer)
+                    for (auto& o : c->layer->clips)
+                        if (o->id != c->id && o->start() >= dragOrigA + dragOrigB - 1e-9)
+                            t = std::min(t, o->start());
                 c->lengthP->setValue((float)std::max(0.05, t - dragOrigA));
                 break;
             }
@@ -1840,6 +2431,109 @@ void TimelineUI::body(Sequence& seq)
                 }
                 break;
             }
+            case Drag::CAKey:
+            case Drag::CABez1:
+            case Drag::CABez2:
+            case Drag::CAEase:
+            case Drag::CAGKey:
+            case Drag::PencilClip:
+            {
+                Clip* c = seq.findClip(dragClipId);
+                ClipAutomation* a = c ? c->findAutomation(dragAutoId) : nullptr;
+                const LaneGeom* g = (c && c->layer) ? geomOf(c->layer) : nullptr;
+                if (!c || !a || !g) break;
+                float cy0, cy1;
+                clipRectY(*g, *c, cy0, cy1);
+                std::vector<AutoRowGeom> rows;
+                buildAutoRows(*c, cy0, rows);
+                const AutoRowGeom* rg = nullptr;
+                for (auto& r : rows) if (r.a == a) rg = &r;
+                if (!rg) break;
+                const double localMouse =
+                    std::max(0.0, std::min(c->length(), xToTime(mouse.x) - c->start()));
+
+                if (drag == Drag::CAKey)
+                {
+                    if (AutoKey* k = a->findKey(dragItemId))
+                    {
+                        double tAbs = snapTime(seq, xToTime(mouse.x), bypassSnap);
+                        k->time = std::max(0.0, std::min(c->length(), tAbs - c->start()));
+                        float nv = caRowYToNorm(*rg, mouse.y);
+                        k->value = a->rangeMin + nv * (a->rangeMax - a->rangeMin);
+                        a->sortKeys();
+                    }
+                }
+                else if (drag == Drag::CABez1 || drag == Drag::CABez2)
+                {
+                    AutoKey* k = a->findKey(dragItemId);
+                    if (!k) break;
+                    AutoKey* nk = nullptr;
+                    for (size_t i = 0; i + 1 < a->keys.size(); i++)
+                        if (a->keys[i].id == k->id) { nk = &a->keys[i + 1]; break; }
+                    if (!nk) break;
+                    double segDur = std::max(1e-4, nk->time - k->time);
+                    float rr = (a->rangeMax - a->rangeMin) == 0 ? 1.f : (a->rangeMax - a->rangeMin);
+                    float na = (k->value - a->rangeMin) / rr, nb = (nk->value - a->rangeMin) / rr;
+                    float nMouse = caRowYToNorm(*rg, mouse.y);
+                    if (drag == Drag::CABez1)
+                    {
+                        k->ep.a1.x = (float)std::max(0.0, std::min(1.0, (localMouse - k->time) / segDur));
+                        k->ep.a1.y = nMouse - na;
+                    }
+                    else
+                    {
+                        k->ep.a2.x = (float)std::max(-1.0, std::min(0.0, (localMouse - nk->time) / segDur));
+                        k->ep.a2.y = nMouse - nb;
+                    }
+                }
+                else if (drag == Drag::CAEase)
+                {
+                    AutoKey* k = a->findKey(dragItemId);
+                    if (!k) break;
+                    float dx = mouse.x - dragStartMouse.x;
+                    float dy = mouse.y - dragStartMouse.y;
+                    if (k->easing == EasingType::Steps)
+                        k->ep.steps = std::max(1, std::min(64, (int)dragOrigC + (int)(dx / 14.f)));
+                    else
+                    {
+                        k->ep.freq = std::max(0.1f, std::min(50.f, (float)dragOrigA * std::pow(2.f, dx / 70.f)));
+                        if (k->easing != EasingType::Elastic)
+                            k->ep.amp = std::max(0.f, std::min(2.f, (float)dragOrigB - dy / 90.f));
+                    }
+                }
+                else if (drag == Drag::CAGKey)
+                {
+                    if (GradKey* k = a->findGradKey(dragItemId))
+                    {
+                        double tAbs = snapTime(seq, xToTime(mouse.x), bypassSnap);
+                        k->time = std::max(0.0, std::min(c->length(), tAbs - c->start()));
+                        a->sortKeys();
+                    }
+                }
+                else // PencilClip: collect the freehand stroke
+                {
+                    float nv = caRowYToNorm(*rg, mouse.y);
+                    float v = a->rangeMin + nv * (a->rangeMax - a->rangeMin);
+                    // paint-over: drawing backwards replaces what was drawn
+                    while (!pencilPts.empty() && pencilPts.back().first >= localMouse)
+                        pencilPts.pop_back();
+                    pencilPts.push_back({ localMouse, v });
+                }
+                break;
+            }
+            case Drag::PencilLane:
+            {
+                auto* al = dynamic_cast<AutomationLayer*>(seq.findLayer(dragLayerId));
+                const LaneGeom* g = al ? geomOf(al) : nullptr;
+                if (!al || !g) break;
+                double t = std::max(0.0, xToTime(mouse.x));
+                float mn = al->rangeMinP->floatValue(), mx = al->rangeMaxP->floatValue();
+                float v = mn + std::max(0.f, std::min(1.f, yToNorm(*g, mouse.y))) * (mx - mn);
+                while (!pencilPts.empty() && pencilPts.back().first >= t)
+                    pencilPts.pop_back();
+                pencilPts.push_back({ t, v });
+                break;
+            }
             case Drag::LayerHeight:
             {
                 if (Layer* l = seq.findLayer(dragLayerId))
@@ -1851,7 +2545,10 @@ void TimelineUI::body(Sequence& seq)
                 if (!dragMoved) break;
                 reorderTarget = (int)seq.layers.size();
                 for (auto& g : geoms)
+                {
+                    if (g.layer == stickyL) continue; // pinned: not a seat
                     if (mouse.y < (g.y0 + g.y1) * 0.5f) { reorderTarget = g.index; break; }
+                }
                 break;
             }
             case Drag::Rubber:
@@ -1921,6 +2618,36 @@ void TimelineUI::body(Sequence& seq)
             {
                 if (dragMoved)
                 {
+                    // released below the last layer: a fresh layer is born
+                    // for the dragged clips (single undo step with the move)
+                    json newLayerJson;
+                    uint64_t newLayerId = 0;
+                    if (dragBelowLanes)
+                    {
+                        auto* nl = static_cast<ClipLayer*>(
+                            seq.addLayer(Layer::LType::Clips, "Layer"));
+                        if (nl)
+                        {
+                            newLayerId = nl->id;
+                            newLayerJson = nl->save(); // EMPTY snapshot — redo
+                                                       // recreates the layer,
+                                                       // the move recs carry
+                                                       // the clips (saving
+                                                       // after the move would
+                                                       // duplicate ids)
+                            for (auto& r : dragClips)
+                            {
+                                Clip* c = seq.findClip(r.clip);
+                                if (!c) continue;
+                                physMoveClip(seq, r.clip, nl->id);
+                                // several dragged clips may collide on the
+                                // fresh track — seat them flush
+                                c->startP->setValue((float)nl->resolveOverlap(
+                                    c->start(), c->length(), { c->id }), false);
+                            }
+                        }
+                    }
+
                     struct MoveRec { uint64_t clip, oldLayer, newLayer; double oldStart, newStart; };
                     std::vector<MoveRec> recs;
                     for (auto& r : dragClips)
@@ -1933,24 +2660,28 @@ void TimelineUI::body(Sequence& seq)
                     for (auto& l : seq.layers)
                         if (auto* cl = dynamic_cast<ClipLayer*>(l.get())) cl->sortClips();
                     UndoManager::get().pushDone("Move Clips",
-                        [sp, recs]
+                        [sp, recs, newLayerJson]
                         {
+                            if (!newLayerJson.is_null() && !newLayerJson.empty())
+                                sp->addLayerFromJson(newLayerJson, -1);
                             for (auto& r : recs)
                             {
                                 physMoveClip(*sp, r.clip, r.newLayer);
                                 if (Clip* c = sp->findClip(r.clip)) c->startP->setValue((float)r.newStart);
                             }
                         },
-                        [sp, recs]
+                        [sp, recs, newLayerId]
                         {
                             for (auto& r : recs)
                             {
                                 physMoveClip(*sp, r.clip, r.oldLayer);
                                 if (Clip* c = sp->findClip(r.clip)) c->startP->setValue((float)r.oldStart);
                             }
+                            if (newLayerId) sp->removeLayer(newLayerId); // now empty
                         },
                         { sp });
                 }
+                dragBelowLanes = false;
                 break;
             }
             case Drag::ResizeL:
@@ -1959,31 +2690,54 @@ void TimelineUI::body(Sequence& seq)
                 Clip* c = seq.findClip(dragItemId);
                 if (c && dragMoved)
                 {
-                    uint64_t cid = dragItemId;
-                    double oS = dragOrigA, oL = dragOrigB, oO = dragOrigC;
-                    double nS = c->start(), nL = c->length();
-                    double nO = c->ctype == Clip::CType::Audio ? c->offsetP->floatValue() : 0.0;
-                    UndoManager::get().pushDone("Resize Clip",
-                        [sp, cid, nS, nL, nO]
-                        {
-                            if (Clip* cc = sp->findClip(cid))
-                            {
-                                cc->startP->setValue((float)nS);
-                                cc->lengthP->setValue((float)nL);
-                                if (cc->ctype == Clip::CType::Audio) cc->offsetP->setValue((float)nO);
-                            }
-                        },
-                        [sp, cid, oS, oL, oO]
-                        {
-                            if (Clip* cc = sp->findClip(cid))
-                            {
-                                cc->startP->setValue((float)oS);
-                                cc->lengthP->setValue((float)oL);
-                                if (cc->ctype == Clip::CType::Audio) cc->offsetP->setValue((float)oO);
-                            }
-                        },
-                        { sp });
+                    // nothing of an automation may outlive the block: keys
+                    // trimmed off by the resize are dropped on release (the
+                    // full-clip undo snapshot still restores them)
+                    c->clampAutomations();
+                    pushClipEdit(sp, dragItemId, dragClipPre, c->save(), "Resize Clip");
                 }
+                break;
+            }
+            case Drag::CAKey:
+            case Drag::CABez1:
+            case Drag::CABez2:
+            case Drag::CAEase:
+            case Drag::CAGKey:
+            {
+                Clip* c = seq.findClip(dragClipId);
+                ClipAutomation* a = c ? c->findAutomation(dragAutoId) : nullptr;
+                if (a && dragMoved)
+                    pushClipAutoKeysEdit(sp, dragClipId, dragAutoId, preEditJson,
+                                         a->keysToJson(), "Edit Keys");
+                break;
+            }
+            case Drag::PencilClip:
+            {
+                Clip* c = seq.findClip(dragClipId);
+                ClipAutomation* a = c ? c->findAutomation(dragAutoId) : nullptr;
+                if (a)
+                {
+                    if (pencilPts.size() >= 2)
+                        a->applyDrawnPoints(pencilPts, 1 /* RDP */, 0.05f);
+                    else if (pencilPts.size() == 1) // a click = one key
+                        a->addKey(pencilPts[0].first, pencilPts[0].second);
+                    pushClipAutoKeysEdit(sp, dragClipId, dragAutoId, preEditJson,
+                                         a->keysToJson(), "Draw Curve");
+                }
+                pencilPts.clear();
+                break;
+            }
+            case Drag::PencilLane:
+            {
+                if (auto* al = dynamic_cast<AutomationLayer*>(seq.findLayer(dragLayerId)))
+                {
+                    if (pencilPts.size() >= 2)
+                        al->applyDrawnPoints(pencilPts, 1 /* RDP */, 0.05f);
+                    else if (pencilPts.size() == 1)
+                        al->addKey(pencilPts[0].first, pencilPts[0].second);
+                    pushKeysEdit(sp, al->id, preEditJson, al->keysToJson(), "Draw Curve");
+                }
+                pencilPts.clear();
                 break;
             }
             case Drag::FadeIn:
@@ -2096,6 +2850,25 @@ void TimelineUI::body(Sequence& seq)
             if (!hit.clip->isSelected()) Selection::get().set(hit.clip);
             ImGui::OpenPopup("clip_ctx");
             break;
+        case Hit::CAKey:
+            ctxItemId = hit.keyId;
+            ctxClipId = hit.clip->id;
+            ctxAutoId = hit.cauto->id;
+            ImGui::OpenPopup("cakey_ctx");
+            break;
+        case Hit::CAGKey:
+            ctxItemId = hit.keyId;
+            ctxClipId = hit.clip->id;
+            ctxAutoId = hit.cauto->id;
+            preEditJson = hit.cauto->keysToJson();
+            ImGui::OpenPopup("cagkey_ctx");
+            break;
+        case Hit::CAHeader: case Hit::CAArm: case Hit::CACurve: case Hit::CAGrad:
+            ctxClipId = hit.clip->id;
+            ctxAutoId = hit.cauto->id;
+            ctxItemId = hit.clip->id;
+            ImGui::OpenPopup("carow_ctx");
+            break;
         case Hit::AKey:
             ctxItemId = hit.keyId;
             ImGui::OpenPopup("akey_ctx");
@@ -2124,9 +2897,13 @@ void TimelineUI::body(Sequence& seq)
     }
 
     // ============================================================ DRAWING
-    float lanesBottom = geoms.empty() ? canvasP0.y : geoms.back().y1;
+    // grid/rubber/playhead vertical extent = the scrolling FLOW (the sticky
+    // lane sits pinned on top and draws over it)
+    float lanesBottom = flowBottom > canvasP0.y + LANE_GAP + stickyBandH
+                            ? flowBottom - LANE_GAP
+                            : canvasP0.y;
 
-    for (auto& g : geoms)
+    auto drawLaneChrome = [&](const LaneGeom& g)
     {
         Layer* l = g.layer;
         bool lSel = l->isSelected();
@@ -2143,6 +2920,7 @@ void TimelineUI::body(Sequence& seq)
         ImU32 nameCol = lEnabled ? IM_COL32(225, 225, 228, 255) : IM_COL32(130, 130, 135, 255);
         cdl->AddText(ImVec2(canvasP0.x + 10, g.y0 + 5), nameCol, l->niceName.c_str());
         std::string typeLbl = Layer::ltypeName(l->ltype);
+        if (l->id == stickyLayerId) typeLbl = "Pinned";
         if (!lEnabled) typeLbl += " (off)";
         if (auto* alr = dynamic_cast<AutomationLayer*>(l))
             if (alr->recArmP->boolValue()) typeLbl += alr->recording ? "  REC" : "  ARM";
@@ -2158,13 +2936,30 @@ void TimelineUI::body(Sequence& seq)
         cdl->AddRectFilled(ImVec2(cLaneX0, g.y0), ImVec2(cLaneX1, g.y1), col32(lcol, 0.05f));
         if (!lEnabled)
             cdl->AddRectFilled(ImVec2(cLaneX0, g.y0), ImVec2(cLaneX1, g.y1), IM_COL32(0, 0, 0, 90));
+    };
+    for (auto& g : geoms) drawLaneChrome(g);
+
+    // clip drag below the last layer → a fresh layer is born on release
+    if (drag == Drag::MoveClips && dragMoved && dragBelowLanes)
+    {
+        float gy = lanesBottom + LANE_GAP;
+        cdl->AddRectFilled(ImVec2(cLaneX0, gy), ImVec2(cLaneX1, gy + 50), IM_COL32(255, 255, 255, 14), 4.f);
+        cdl->AddRect(ImVec2(cLaneX0, gy), ImVec2(cLaneX1, gy + 50), col32(accent, 0.5f), 4.f, 0, 1.5f);
+        cdl->AddText(ImVec2(cLaneX0 + 8, gy + 4), IM_COL32(200, 200, 205, 220),
+                     "New layer — drop here");
     }
 
     // layer reorder preview line
     if (drag == Drag::LayerReorder && dragMoved && reorderTarget >= 0)
     {
-        float y = reorderTarget < (int)geoms.size() ? geoms[reorderTarget].y0 - 1
-                                                    : (geoms.empty() ? canvasP0.y : geoms.back().y1 + 1);
+        // reorderTarget is a LAYER index — map to the first FLOW geom at or
+        // after it (the pinned lane is out of the flow and never a seat)
+        float y = lanesBottom + 1;
+        for (auto& g : geoms)
+        {
+            if (g.layer == stickyL) continue;
+            if (g.index >= reorderTarget) { y = g.y0 - 1; break; }
+        }
         cdl->AddLine(ImVec2(canvasP0.x, y), ImVec2(cLaneX1, y), accentU, 2.f);
     }
 
@@ -2205,6 +3000,18 @@ void TimelineUI::body(Sequence& seq)
     double nowT = ImGui::GetTime();
     for (auto& g : geoms)
     {
+        // the pinned lane draws LAST (it is the last geom): repaint its
+        // opaque backdrop first — flow lanes scroll BENEATH it — and give
+        // it a drop shadow so the separation reads
+        if (g.layer == stickyL)
+        {
+            drawLaneChrome(g);
+            cdl->AddRectFilledMultiColor(ImVec2(canvasP0.x, g.y1), ImVec2(cLaneX1, g.y1 + 9.f),
+                                         IM_COL32(0, 0, 0, 130), IM_COL32(0, 0, 0, 130),
+                                         IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0));
+            cdl->AddLine(ImVec2(canvasP0.x, g.y1 + 0.5f), ImVec2(cLaneX1, g.y1 + 0.5f),
+                         IM_COL32(70, 70, 76, 200), 1.f);
+        }
         cdl->PushClipRect(ImVec2(cLaneX0, g.y0), ImVec2(cLaneX1, g.y1), true);
         bool lEnabled = g.layer->enabledP->boolValue();
 
@@ -2216,14 +3023,38 @@ void TimelineUI::body(Sequence& seq)
                 float x0 = timeToX(c->start());
                 float x1 = timeToX(c->end());
                 if (x1 < cLaneX0 - 2 || x0 > cLaneX1 + 2) continue;
-                float y0 = g.y0 + 3, y1 = g.y1 - 3;
+                float y0, y1;
+                clipRectY(g, *c, y0, y1);
                 ImVec4 col = c->colorP->color();
                 bool sel = c->isSelected();
                 bool pre = c->isPreselected();
                 bool hov = (hit.clip == c);
                 bool cEnabled = c->enabled() && lEnabled;
+                bool liveNow = seq.playing && cEnabled &&
+                               seq.currentTime >= c->start() && seq.currentTime < c->end();
                 ImVec4 fill = sel ? lighten(col, 0.08f) : col;
-                cdl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1), col32(fill, cEnabled ? 0.95f : 0.38f), 4.f);
+                const bool blockStyle = c->ctype == Clip::CType::Block && !c->automations.empty();
+                if (blockStyle)
+                {
+                    // effect block: soft body, tinted title strip, inner top
+                    // highlight — its automations render as rows below
+                    cdl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1),
+                                       col32(ImVec4(fill.x * 0.32f, fill.y * 0.32f, fill.z * 0.32f, 1.f),
+                                             cEnabled ? 0.98f : 0.5f), 5.f);
+                    cdl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, std::min(y1, y0 + CA_TITLE_H)),
+                                       col32(fill, cEnabled ? 0.9f : 0.35f), 5.f,
+                                       ImDrawFlags_RoundCornersTop);
+                    cdl->AddLine(ImVec2(x0 + 3, y0 + 1), ImVec2(x1 - 3, y0 + 1),
+                                 col32(lighten(fill, 0.25f), 0.5f), 1.f);
+                }
+                else
+                {
+                    cdl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1), col32(fill, cEnabled ? 0.95f : 0.38f), 4.f);
+                }
+                if (liveNow)
+                    cdl->AddRect(ImVec2(x0 - 1, y0 - 1), ImVec2(x1 + 1, y1 + 1),
+                                 col32(accent, 0.28f + 0.18f * (float)std::sin(nowT * 6.0)),
+                                 5.f, 0, 2.f);
 
                 // waveform (with fade envelope + media loop tiling)
                 if (c->ctype == Clip::CType::Audio && c->asset)
@@ -2299,6 +3130,287 @@ void TimelineUI::body(Sequence& seq)
                 cdl->AddText(ImVec2(x0 + 6, y0 + 3), IM_COL32(10, 10, 12, 220), c->niceName.c_str());
                 cdl->AddText(ImVec2(x0 + 5, y0 + 2), IM_COL32(255, 255, 255, cEnabled ? 235 : 130), c->niceName.c_str());
                 cdl->PopClipRect();
+
+                // ---- embedded automation rows (the block CONTAINS its
+                // automations: compact named headers, expandable editors) ----
+                if (blockStyle)
+                {
+                    std::vector<AutoRowGeom> rows;
+                    buildAutoRows(*c, y0, rows);
+                    cdl->PushClipRect(ImVec2(x0 + 1, y0), ImVec2(x1 - 1, y1), true);
+                    for (auto& rg : rows)
+                    {
+                        ClipAutomation* a = rg.a;
+                        const bool isGrad = a->akind == ClipAutomation::AKind::Gradient;
+                        const bool rowHov = hit.cauto == a && hit.clip == c;
+                        const float open = a->uiAnim < 0 ? (a->expanded ? 1.f : 0.f) : a->uiAnim;
+
+                        // header strip: expand triangle + name + live chip + rec dot
+                        ImU32 hcol = IM_COL32(255, 255, 255, rowHov ? 26 : 14);
+                        cdl->AddRectFilled(ImVec2(x0 + 3, rg.hy0 + 1), ImVec2(x1 - 3, rg.hy1 - 1),
+                                           hcol, 3.f);
+                        cdl->AddRectFilled(ImVec2(x0 + 3, rg.hy0 + 1), ImVec2(x0 + 5.5f, rg.hy1 - 1),
+                                           col32(a->color, cEnabled ? 0.9f : 0.4f), 2.f);
+                        // triangle rotates smoothly right → down with `open`
+                        {
+                            ImVec2 tc(x0 + 13.f, (rg.hy0 + rg.hy1) * 0.5f);
+                            float r = 3.6f;
+                            float ang = open * 1.5707963f; // 0 → 90°
+                            auto rot = [&](float px, float py)
+                            {
+                                float ca = std::cos(ang), sa = std::sin(ang);
+                                return ImVec2(tc.x + px * ca - py * sa, tc.y + px * sa + py * ca);
+                            };
+                            ImVec2 t1 = rot(-r * 0.6f, -r), t2 = rot(-r * 0.6f, r), t3 = rot(r, 0);
+                            cdl->AddTriangleFilled(t1, t2, t3, IM_COL32(235, 235, 240, cEnabled ? 220 : 120));
+                        }
+                        // small row label
+                        const float rowFontSz = ImGui::GetFontSize() * 0.86f;
+                        cdl->AddText(ImGui::GetFont(), rowFontSz,
+                                     ImVec2(x0 + 20, rg.hy0 + 2.f),
+                                     IM_COL32(225, 225, 230, cEnabled ? 225 : 120),
+                                     a->name.c_str());
+                        float nameW = ImGui::GetFont()->CalcTextSizeA(
+                            rowFontSz, FLT_MAX, 0.f, a->name.c_str()).x;
+
+                        // live value chip at the right (playhead inside → live)
+                        {
+                            double lt = seq.currentTime - c->start();
+                            bool inside = lt >= 0 && lt <= c->length();
+                            char chip[24] = {};
+                            if (isGrad)
+                            {
+                                if (!a->gkeys.empty())
+                                {
+                                    ImVec4 cc2 = a->colorAt(std::max(0.0, std::min(c->length(), lt)));
+                                    cdl->AddRectFilled(ImVec2(x1 - 34, rg.hy0 + 3.5f), ImVec2(x1 - 20, rg.hy1 - 3.5f),
+                                                       col32(cc2), 2.f);
+                                    cdl->AddRect(ImVec2(x1 - 34, rg.hy0 + 3.5f), ImVec2(x1 - 20, rg.hy1 - 3.5f),
+                                                 IM_COL32(0, 0, 0, 120), 2.f);
+                                }
+                            }
+                            else if (!a->keys.empty())
+                            {
+                                snprintf(chip, sizeof(chip), "%.2f",
+                                         a->valueAt(std::max(0.0, std::min(c->length(), lt))));
+                                const float chipSz = ImGui::GetFontSize() * 0.8f;
+                                float cw = ImGui::GetFont()->CalcTextSizeA(chipSz, FLT_MAX, 0.f, chip).x;
+                                cdl->AddText(ImGui::GetFont(), chipSz,
+                                             ImVec2(x1 - 22 - cw, rg.hy0 + 2.5f),
+                                             inside && seq.playing ? accentU
+                                                                   : IM_COL32(160, 160, 168, 200),
+                                             chip);
+                            }
+                        }
+                        // record dot
+                        {
+                            ImVec2 dot(x1 - 10.f, (rg.hy0 + rg.hy1) * 0.5f);
+                            bool recNow = a->recording;
+                            float pulse = recNow ? (0.6f + 0.4f * (float)std::sin(nowT * 8.0)) : 1.f;
+                            ImU32 dcol = a->recArm ? IM_COL32((int)(230 * pulse), 40, 40, 255)
+                                                   : IM_COL32(120, 120, 128, rowHov ? 200 : 90);
+                            cdl->AddCircleFilled(dot, 3.2f, dcol);
+                            if (a->recArm) cdl->AddCircle(dot, 5.f, IM_COL32(230, 60, 60, 150), 0, 1.f);
+                        }
+
+                        // collapsed sparkline preview between name and chips
+                        if (open < 0.999f && !isGrad && !a->keys.empty())
+                        {
+                            float sx0 = x0 + 26 + nameW, sx1 = x1 - 40;
+                            if (sx1 > sx0 + 24)
+                            {
+                                float sy0 = rg.hy0 + 3, sy1 = rg.hy1 - 3;
+                                const int N = std::min(48, (int)((sx1 - sx0) / 3));
+                                ImVec2 prev;
+                                for (int i = 0; i <= N; i++)
+                                {
+                                    double lt = c->length() * i / std::max(1, N);
+                                    float nv = a->normValueAt(lt);
+                                    ImVec2 p(sx0 + (sx1 - sx0) * i / std::max(1, N),
+                                             sy1 - nv * (sy1 - sy0));
+                                    if (i) cdl->AddLine(prev, p, col32(a->color, (0.999f - open) * 0.6f), 1.f);
+                                    prev = p;
+                                }
+                            }
+                        }
+                        else if (open < 0.999f && isGrad && !a->gkeys.empty())
+                        {
+                            float sx0 = x0 + 26 + nameW, sx1 = x1 - 40;
+                            if (sx1 > sx0 + 24)
+                                for (float px = sx0; px < sx1; px += 3.f)
+                                {
+                                    double lt = c->length() * (px - sx0) / std::max(1.f, sx1 - sx0);
+                                    cdl->AddRectFilled(ImVec2(px, rg.hy0 + 4), ImVec2(px + 3, rg.hy1 - 4),
+                                                       col32(a->colorAt(lt), (0.999f - open) * 0.8f));
+                                }
+                        }
+
+                        // expanded editor body
+                        if (rg.by1 > rg.by0 + 4)
+                        {
+                            cdl->PushClipRect(ImVec2(std::max(x0 + 3, cLaneX0), rg.by0),
+                                              ImVec2(std::min(x1 - 3, cLaneX1), rg.by1), true);
+                            cdl->AddRectFilled(ImVec2(x0 + 3, rg.by0), ImVec2(x1 - 3, rg.by1),
+                                               IM_COL32(12, 12, 14, 235), 3.f);
+                            if (isGrad)
+                            {
+                                float gy0 = rg.by0 + 3, gy1 = rg.by1 - 3;
+                                if (a->gkeys.empty())
+                                    cdl->AddText(ImVec2(x0 + 10, rg.by0 + 3), IM_COL32(110, 110, 118, 200),
+                                                 "double-click: add color");
+                                else
+                                {
+                                    float xf = x0 + (float)(a->gkeys.front().time * pps);
+                                    float xl = x0 + (float)(a->gkeys.back().time * pps);
+                                    if (xf > x0 + 3)
+                                        cdl->AddRectFilled(ImVec2(x0 + 3, gy0), ImVec2(xf, gy1),
+                                                           col32(a->gkeys.front().color));
+                                    if (xl < x1 - 3)
+                                        cdl->AddRectFilled(ImVec2(xl, gy0), ImVec2(x1 - 3, gy1),
+                                                           col32(a->gkeys.back().color));
+                                    for (size_t i = 0; i + 1 < a->gkeys.size(); i++)
+                                    {
+                                        const GradKey& ka = a->gkeys[i];
+                                        const GradKey& kb = a->gkeys[i + 1];
+                                        float xa = x0 + (float)(ka.time * pps);
+                                        float xb = x0 + (float)(kb.time * pps);
+                                        if (xb <= xa) continue;
+                                        if (ka.hold)
+                                            cdl->AddRectFilled(ImVec2(xa, gy0), ImVec2(xb, gy1), col32(ka.color));
+                                        else
+                                            cdl->AddRectFilledMultiColor(ImVec2(xa, gy0), ImVec2(xb, gy1),
+                                                                         col32(ka.color), col32(kb.color),
+                                                                         col32(kb.color), col32(ka.color));
+                                    }
+                                    for (auto& k : a->gkeys)
+                                    {
+                                        float kx = x0 + (float)(k.time * pps);
+                                        bool ksel = a->selectedKeys.count(k.id) != 0;
+                                        drawDiamond(cdl, ImVec2(kx, rg.by1 - 6), 4.f, col32(k.color),
+                                                    ksel ? accentU : IM_COL32(230, 230, 235, 255));
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                // grid
+                                for (float f : { 0.f, 0.5f, 1.f })
+                                    cdl->AddLine(ImVec2(x0 + 3, caRowNormToY(rg, f)),
+                                                 ImVec2(x1 - 3, caRowNormToY(rg, f)),
+                                                 IM_COL32(255, 255, 255, f == 0.5f ? 13 : 7), 1.f);
+                                if (a->keys.empty() && !a->recording)
+                                    cdl->AddText(ImVec2(x0 + 10, rg.by0 + 4), IM_COL32(110, 110, 118, 200),
+                                                 pencilMode ? "click: add key - drag: draw"
+                                                            : "double-click: add keys");
+                                float rmn = a->rangeMin, rmx = a->rangeMax;
+                                float rr = (rmx - rmn) == 0 ? 1.f : (rmx - rmn);
+                                ImU32 curveC = col32(lighten(a->color, 0.12f), cEnabled ? 1.f : 0.45f);
+                                if (!a->keys.empty())
+                                {
+                                    // flats before/after + segments + area fill
+                                    const AutoKey& kf = a->keys.front();
+                                    const AutoKey& kl = a->keys.back();
+                                    float yf = caRowNormToY(rg, (kf.value - rmn) / rr);
+                                    float yl = caRowNormToY(rg, (kl.value - rmn) / rr);
+                                    float xf = x0 + (float)(kf.time * pps);
+                                    float xl = x0 + (float)(kl.time * pps);
+                                    if (xf > x0 + 3) cdl->AddLine(ImVec2(x0 + 3, yf), ImVec2(xf, yf), curveC, 1.6f);
+                                    if (xl < x1 - 3) cdl->AddLine(ImVec2(xl, yl), ImVec2(x1 - 3, yl), curveC, 1.6f);
+                                    std::vector<ImVec2> pts;
+                                    for (size_t i = 0; i + 1 < a->keys.size(); i++)
+                                    {
+                                        const AutoKey& ka = a->keys[i];
+                                        const AutoKey& kb = a->keys[i + 1];
+                                        float xa = x0 + (float)(ka.time * pps);
+                                        float xb = x0 + (float)(kb.time * pps);
+                                        if (xb < cLaneX0 - 4 || xa > cLaneX1 + 4) continue;
+                                        float na = (ka.value - rmn) / rr, nb = (kb.value - rmn) / rr;
+                                        if (ka.easing == EasingType::Hold)
+                                        {
+                                            cdl->AddLine(ImVec2(xa, caRowNormToY(rg, na)), ImVec2(xb, caRowNormToY(rg, na)), curveC, 1.6f);
+                                            cdl->AddLine(ImVec2(xb, caRowNormToY(rg, na)), ImVec2(xb, caRowNormToY(rg, nb)), curveC, 1.6f);
+                                            continue;
+                                        }
+                                        int n = (int)std::max(2.f, std::min(120.f, (xb - xa) / 3.f));
+                                        if (ka.easing == EasingType::Linear) n = 2;
+                                        pts.clear();
+                                        for (int s2 = 0; s2 <= n; s2++)
+                                        {
+                                            float w = (float)s2 / n;
+                                            float v = ease(ka.easing, na, nb, w, ka.ep);
+                                            pts.push_back(ImVec2(xa + (xb - xa) * w, caRowNormToY(rg, v)));
+                                        }
+                                        // soft area fill under the segment
+                                        for (size_t pi = 0; pi + 1 < pts.size(); pi++)
+                                            cdl->AddQuadFilled(pts[pi], pts[pi + 1],
+                                                               ImVec2(pts[pi + 1].x, rg.by1 - 2),
+                                                               ImVec2(pts[pi].x, rg.by1 - 2),
+                                                               col32(a->color, 0.10f));
+                                        cdl->AddPolyline(pts.data(), (int)pts.size(), curveC, 0, 1.7f);
+                                    }
+                                    for (auto& k : a->keys)
+                                    {
+                                        float kx = x0 + (float)(k.time * pps);
+                                        float ky = caRowNormToY(rg, (k.value - rmn) / rr);
+                                        bool ksel = a->selectedKeys.count(k.id) != 0;
+                                        bool khov = hit.kind == Hit::CAKey && hit.keyId == k.id && hit.cauto == a;
+                                        cdl->AddCircleFilled(ImVec2(kx, ky), 3.6f, ksel ? accentU : IM_COL32(22, 22, 25, 255));
+                                        cdl->AddCircle(ImVec2(kx, ky), 3.6f, ksel ? IM_COL32_WHITE : curveC, 0, khov ? 2.2f : 1.3f);
+                                        if (khov && drag == Drag::None)
+                                            ImGui::SetTooltip("%.3fs | %.3f | %s", k.time, k.value, easingName(k.easing));
+                                    }
+                                    // handles of selected keys
+                                    for (size_t i = 0; i + 1 < a->keys.size(); i++)
+                                    {
+                                        AutoKey& k = a->keys[i];
+                                        if (!a->selectedKeys.count(k.id)) continue;
+                                        AutoKey& nk = a->keys[i + 1];
+                                        double segDur = nk.time - k.time;
+                                        float na = (k.value - rmn) / rr, nb = (nk.value - rmn) / rr;
+                                        if (k.easing == EasingType::Bezier)
+                                        {
+                                            ImVec2 kp(x0 + (float)(k.time * pps), caRowNormToY(rg, na));
+                                            ImVec2 np(x0 + (float)(nk.time * pps), caRowNormToY(rg, nb));
+                                            ImVec2 h1(x0 + (float)((k.time + k.ep.a1.x * segDur) * pps), caRowNormToY(rg, na + k.ep.a1.y));
+                                            ImVec2 h2(x0 + (float)((nk.time + k.ep.a2.x * segDur) * pps), caRowNormToY(rg, nb + k.ep.a2.y));
+                                            cdl->AddLine(kp, h1, IM_COL32(255, 255, 255, 90), 1.f);
+                                            cdl->AddLine(np, h2, IM_COL32(255, 255, 255, 90), 1.f);
+                                            cdl->AddRectFilled(ImVec2(h1.x - 2.5f, h1.y - 2.5f), ImVec2(h1.x + 2.5f, h1.y + 2.5f), IM_COL32_WHITE);
+                                            cdl->AddRectFilled(ImVec2(h2.x - 2.5f, h2.y - 2.5f), ImVec2(h2.x + 2.5f, h2.y + 2.5f), IM_COL32_WHITE);
+                                        }
+                                        else if (easingHasHandle(k.easing))
+                                        {
+                                            double midT = (k.time + nk.time) * 0.5;
+                                            float midV = ease(k.easing, na, nb, 0.5f, k.ep);
+                                            ImVec2 hm(x0 + (float)(midT * pps), caRowNormToY(rg, midV));
+                                            cdl->AddCircleFilled(hm, 3.2f, IM_COL32(255, 255, 255, 220));
+                                            cdl->AddCircle(hm, 5.f, IM_COL32(255, 255, 255, 90), 0, 1.f);
+                                        }
+                                    }
+                                }
+                                // pencil stroke in progress on this row
+                                if (drag == Drag::PencilClip && dragClipId == c->id &&
+                                    dragAutoId == a->id && pencilPts.size() >= 2)
+                                {
+                                    std::vector<ImVec2> sp2;
+                                    for (auto& p : pencilPts)
+                                        sp2.push_back(ImVec2(x0 + (float)(p.first * pps),
+                                                             caRowNormToY(rg, (p.second - rmn) / rr)));
+                                    cdl->AddPolyline(sp2.data(), (int)sp2.size(), accentU, 0, 2.f);
+                                }
+                                // live playhead dot
+                                double lt = seq.currentTime - c->start();
+                                if (lt >= 0 && lt <= c->length() && !a->keys.empty())
+                                {
+                                    float phx2 = x0 + (float)(lt * pps);
+                                    cdl->AddCircleFilled(ImVec2(phx2, caRowNormToY(rg, a->normValueAt(lt))), 2.6f, accentU);
+                                }
+                            }
+                            cdl->PopClipRect();
+                        }
+                    }
+                    cdl->PopClipRect();
+                }
 
                 if (sel) cdl->AddRect(ImVec2(x0, y0), ImVec2(x1, y1), accentU, 4.f, 0, 2.f);
                 else if (pre) cdl->AddRect(ImVec2(x0, y0), ImVec2(x1, y1), col32(accent, 0.65f), 4.f, 0, 1.5f);
@@ -2431,6 +3543,15 @@ void TimelineUI::body(Sequence& seq)
                 }
                 if (rp.size() >= 2)
                     cdl->AddPolyline(rp.data(), (int)rp.size(), IM_COL32(255, 70, 70, 220), 0, 2.f);
+            }
+
+            // pencil stroke in progress on this lane
+            if (drag == Drag::PencilLane && dragLayerId == al->id && pencilPts.size() >= 2)
+            {
+                std::vector<ImVec2> sp2;
+                for (auto& p : pencilPts)
+                    sp2.push_back(ImVec2(timeToX(p.first), normToY(g, (p.second - mn) / range)));
+                cdl->AddPolyline(sp2.data(), (int)sp2.size(), accentU, 0, 2.f);
             }
         }
         else if (auto* gl = dynamic_cast<GradientLayer*>(g.layer))
@@ -2566,19 +3687,28 @@ void TimelineUI::body(Sequence& seq)
                 ImVec4 gcol(mp.color[0], mp.color[1], mp.color[2], 0.55f);
                 const LaneGeom* g = laneAtY(mouse.y);
                 ClipLayer* target = g ? dynamic_cast<ClipLayer*>(g->layer) : nullptr;
+                // the pinned audio lane only takes audio media — an effect
+                // dropped on it falls through to the new-layer seat below
+                if (target && target->id == stickyLayerId && mp.kind != 1)
+                {
+                    target = nullptr;
+                    g = nullptr;
+                }
 
                 if (target)
                 {
-                    cdl->AddRectFilled(ImVec2(timeToX(t), g->y0 + 3), ImVec2(timeToX(t + len), g->y1 - 3),
+                    // preview the RESOLVED seat — blocks butt flush, never stack
+                    const double rt = target->resolveOverlap(t, len);
+                    cdl->AddRectFilled(ImVec2(timeToX(rt), g->y0 + 3), ImVec2(timeToX(rt + len), g->y1 - 3),
                                        col32(gcol), 4.f);
-                    cdl->AddRect(ImVec2(timeToX(t), g->y0 + 3), ImVec2(timeToX(t + len), g->y1 - 3),
+                    cdl->AddRect(ImVec2(timeToX(rt), g->y0 + 3), ImVec2(timeToX(rt + len), g->y1 - 3),
                                  accentU, 4.f, 0, 2.f);
                     if (pl->IsDelivery())
-                        createClipFromPayload(target, t, mp);
+                        createClipFromPayload(target, rt, mp);
                 }
                 else
                 {
-                    float gy = geoms.empty() ? canvasP0.y + LANE_GAP : geoms.back().y1 + LANE_GAP;
+                    float gy = lanesBottom + LANE_GAP;
                     cdl->AddRectFilled(ImVec2(cLaneX0, gy), ImVec2(cLaneX1, gy + 50), IM_COL32(255, 255, 255, 14), 4.f);
                     cdl->AddRectFilled(ImVec2(timeToX(t), gy + 3), ImVec2(timeToX(t + len), gy + 47), col32(gcol), 4.f);
                     cdl->AddText(ImVec2(cLaneX0 + 8, gy + 4), IM_COL32(200, 200, 205, 200), "New layer");
@@ -2730,29 +3860,177 @@ void TimelineUI::body(Sequence& seq)
         ImGui::EndPopup();
     }
 
+    // ---- embedded clip-automation popups --------------------------------
+    if (ImGui::BeginPopup("cakey_ctx"))
+    {
+        Clip* c = seq.findClip(ctxClipId);
+        ClipAutomation* a = c ? c->findAutomation(ctxAutoId) : nullptr;
+        AutoKey* k = a ? a->findKey(ctxItemId) : nullptr;
+        if (a && k)
+        {
+            ImGui::TextDisabled("%s @ %.3fs", a->name.c_str(), k->time);
+            ImGui::Separator();
+            for (int e = 0; e < (int)EasingType::COUNT; e++)
+            {
+                bool active = (int)k->easing == e;
+                if (ImGui::MenuItem(easingName((EasingType)e), nullptr, active))
+                {
+                    json pre = a->keysToJson();
+                    if (a->selectedKeys.count(k->id))
+                        for (uint64_t kid : a->selectedKeys)
+                        {
+                            if (AutoKey* kk = a->findKey(kid)) kk->easing = (EasingType)e;
+                        }
+                    else k->easing = (EasingType)e;
+                    pushClipAutoKeysEdit(sp, ctxClipId, ctxAutoId, pre, a->keysToJson(),
+                                         "Change Easing");
+                }
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Delete Key", "Del"))
+            {
+                json pre = a->keysToJson();
+                if (a->selectedKeys.count(k->id))
+                    for (uint64_t kid : std::vector<uint64_t>(a->selectedKeys.begin(),
+                                                              a->selectedKeys.end()))
+                        a->removeKey(kid);
+                else a->removeKey(k->id);
+                pushClipAutoKeysEdit(sp, ctxClipId, ctxAutoId, pre, a->keysToJson(),
+                                     "Delete Key");
+            }
+        }
+        ImGui::EndPopup();
+    }
+
+    {
+        bool cagkeyOpenNow = false;
+        if (ImGui::BeginPopup("cagkey_ctx"))
+        {
+            cagkeyOpenNow = true;
+            Clip* c = seq.findClip(ctxClipId);
+            ClipAutomation* a = c ? c->findAutomation(ctxAutoId) : nullptr;
+            GradKey* k = a ? a->findGradKey(ctxItemId) : nullptr;
+            if (a && k)
+            {
+                float col[4] = { k->color.x, k->color.y, k->color.z, k->color.w };
+                ImGui::SetNextItemWidth(200);
+                if (ImGui::ColorPicker4("##cagk", col, ImGuiColorEditFlags_NoSidePreview | ImGuiColorEditFlags_NoAlpha))
+                    k->color = ImVec4(col[0], col[1], col[2], 1.f);
+                bool hold = k->hold;
+                if (ImGui::Checkbox("Hold (no interpolation)", &hold)) k->hold = hold;
+                ImGui::Separator();
+                if (ImGui::MenuItem("Delete Key", "Del"))
+                {
+                    json pre = a->keysToJson();
+                    a->removeKey(k->id);
+                    pushClipAutoKeysEdit(sp, ctxClipId, ctxAutoId, pre, a->keysToJson(),
+                                         "Delete Color Key");
+                }
+            }
+            ImGui::EndPopup();
+        }
+        if (cagkeyWasOpen && !cagkeyOpenNow)
+        {
+            Clip* c = seq.findClip(ctxClipId);
+            if (ClipAutomation* a = c ? c->findAutomation(ctxAutoId) : nullptr)
+                pushClipAutoKeysEdit(sp, ctxClipId, ctxAutoId, preEditJson,
+                                     a->keysToJson(), "Edit Color Key");
+        }
+        cagkeyWasOpen = cagkeyOpenNow;
+    }
+
+    if (ImGui::BeginPopup("carow_ctx"))
+    {
+        Clip* c = seq.findClip(ctxClipId);
+        ClipAutomation* a = c ? c->findAutomation(ctxAutoId) : nullptr;
+        if (c && a)
+        {
+            ImGui::TextDisabled("%s — %s", c->niceName.c_str(), a->name.c_str());
+            ImGui::Separator();
+            if (ImGui::MenuItem(a->expanded ? "Collapse" : "Expand"))
+                a->expanded = !a->expanded;
+            if (ImGui::MenuItem("Record Arm", nullptr, a->recArm))
+            {
+                a->recArm = !a->recArm;
+                if (!a->recArm && a->recording) a->stopRecordingAndApply();
+            }
+            ImGui::Separator();
+            bool hasKeys = !a->keys.empty() || !a->gkeys.empty();
+            if (ImGui::MenuItem("Clear Keys", nullptr, false, hasKeys))
+            {
+                json pre = a->keysToJson();
+                a->keys.clear();
+                a->gkeys.clear();
+                a->selectedKeys.clear();
+                pushClipAutoKeysEdit(sp, ctxClipId, ctxAutoId, pre, a->keysToJson(),
+                                     "Clear Keys");
+            }
+            if (ImGui::MenuItem("Remove Automation"))
+            {
+                // host-derived rows: let the app clear whatever owns the
+                // row (its reconciliation removes it) — else local removal
+                if (!(removeAutomationHook && removeAutomationHook(*c, *a)))
+                {
+                    uint64_t cid = ctxClipId;
+                    json data = c->removeAutomation(a->id);
+                    if (!data.is_null() && !data.empty())
+                    {
+                        UndoManager::get().pushDone("Remove Automation",
+                            [sp, cid, data]
+                            {
+                                if (Clip* cc = sp->findClip(cid))
+                                    cc->removeAutomation(data.value("id", (uint64_t)0));
+                            },
+                            [sp, cid, data]
+                            {
+                                if (Clip* cc = sp->findClip(cid))
+                                {
+                                    ClipAutomation* na = cc->addAutomation(
+                                        ClipAutomation::AKind::Curve,
+                                        data.value("name", "Automation"));
+                                    na->load(data);
+                                }
+                            },
+                            { sp });
+                    }
+                }
+            }
+        }
+        ImGui::EndPopup();
+    }
+
     auto layerOpsMenu = [&](Layer* l)
     {
         int idx = seq.layerIndex(l);
         bool en = l->enabledP->boolValue();
         if (ImGui::MenuItem("Enabled", nullptr, en)) l->enabledP->setUndoable(!en);
-        if (ImGui::MenuItem("Rename..."))
+        if (offerLayerRename && ImGui::MenuItem("Rename..."))
         {
             ctxLayerId = l->id;
             snprintf(renameBuf, sizeof(renameBuf), "%s", l->niceName.c_str());
             wantRenamePopup = true;
         }
-        if (ImGui::MenuItem("Move Up", nullptr, false, idx > 0)) moveLayerUndoable(idx, idx - 1);
-        if (ImGui::MenuItem("Move Down", nullptr, false, idx < (int)seq.layers.size() - 1)) moveLayerUndoable(idx, idx + 1);
-        if (ImGui::MenuItem("Duplicate Layer")) duplicateLayerUndoable(l->id);
+        const bool sticky = l->id == stickyLayerId; // pinned: position is fixed,
+                                                    // and it stays SINGLE
+        if (!sticky)
+        {
+            if (ImGui::MenuItem("Move Up", nullptr, false, idx > 0)) moveLayerUndoable(idx, idx - 1);
+            if (ImGui::MenuItem("Move Down", nullptr, false, idx < (int)seq.layers.size() - 1)) moveLayerUndoable(idx, idx + 1);
+            if (ImGui::MenuItem("Duplicate Layer")) duplicateLayerUndoable(l->id);
+        }
         if (ImGui::MenuItem("Delete Layer")) removeLayerUndoable(l->id);
     };
 
     auto addLayerMenu = [&](int insertIdx)
     {
-        if (ImGui::MenuItem("Clip Layer")) addLayerUndoable(Layer::LType::Clips, "Clips", insertIdx);
-        if (ImGui::MenuItem("Automation Layer")) addLayerUndoable(Layer::LType::Automation, "Automation", insertIdx);
-        if (ImGui::MenuItem("Gradient Layer")) addLayerUndoable(Layer::LType::Gradient, "Gradient", insertIdx);
-        if (ImGui::MenuItem("Trigger Layer")) addLayerUndoable(Layer::LType::Triggers, "Triggers", insertIdx);
+        if (offerClipLayers && ImGui::MenuItem("Clip Layer"))
+            addLayerUndoable(Layer::LType::Clips, "Clips", insertIdx);
+        if (offerAutomationLayers && ImGui::MenuItem("Automation Layer"))
+            addLayerUndoable(Layer::LType::Automation, "Automation", insertIdx);
+        if (offerGradientLayers && ImGui::MenuItem("Gradient Layer"))
+            addLayerUndoable(Layer::LType::Gradient, "Gradient", insertIdx);
+        if (offerTriggerLayers && ImGui::MenuItem("Trigger Layer"))
+            addLayerUndoable(Layer::LType::Triggers, "Triggers", insertIdx);
     };
 
     if (ImGui::BeginPopup("lane_ctx"))
@@ -2762,13 +4040,16 @@ void TimelineUI::body(Sequence& seq)
         {
             if (ImGui::MenuItem("Add Clip Here"))
             {
-                Clip* c = cl->addClip(Clip::CType::Block, "Clip", ctxTime, std::max(1.0, snapStep(seq, pps) * 4.0));
+                const double len = std::max(1.0, snapStep(seq, pps) * 4.0);
+                Clip* c = cl->addClip(Clip::CType::Block, "Clip",
+                                      cl->resolveOverlap(ctxTime, len), len);
                 pushClipAdded(sp, cl->id, c->save(), "Add Clip");
                 c->select();
             }
             if (ImGui::MenuItem("Add Audio Clip Here"))
             {
-                Clip* c = cl->addClip(Clip::CType::Audio, "Audio", ctxTime, 4.0);
+                Clip* c = cl->addClip(Clip::CType::Audio, "Audio",
+                                      cl->resolveOverlap(ctxTime, 4.0), 4.0);
                 pushClipAdded(sp, cl->id, c->save(), "Add Audio Clip");
                 c->select();
             }

@@ -20,7 +20,35 @@ content on rich timelines.
   - Clip layers: drag & drop boxes, move across layers, resize with edge grips,
     multi-select (rubber band with preselection / `Ctrl`), duplicate, split,
     copy/paste at the playhead, grid **and magnet snapping** (clip edges, keys,
-    cues, playhead), context menus everywhere.
+    cues, playhead), context menus everywhere. Two clips on one layer **never
+    overlap in time** — moves/resizes/drops seat flush against neighbours.
+  - **Embedded clip automations** (`ClipAutomation`): a block clip *contains*
+    its automations as internal rows — value curves or color gradients with
+    **clip-local** key times (nothing extends beyond the block; keys travel
+    with it, split with it, die with it). Rows collapse to a compact named
+    header (sparkline preview, live value chip, record dot) and expand — with
+    a smooth animation that grows the block *and* the track — into a full
+    curve/gradient editor (keys, easings, bezier handles, host-fed recorder).
+  - **Pencil / Draw mode** (`P` or the toolbar toggle): click-drag across any
+    automation editor (embedded row or classic lane) to draw the curve
+    freehand — keys are generated from the stroke (RDP-simplified).
+  - Host-configurable "Add Layer" menus (`offerClipLayers`,
+    `offerAutomationLayers`, `offerGradientLayers`, `offerTriggerLayers`):
+    apps embedding automations inside clips hide the standalone lane types;
+    existing layers of a hidden type still render and edit. Layer renaming
+    can be disabled too (`offerLayerRename`) for hosts that auto-name.
+  - **Sticky layer** (`stickyLayerId`): one layer renders PINNED under the
+    ruler and never scrolls out of view (the audio/waveform lane everything
+    is aligned against). It leaves the scroll flow, cannot be reordered,
+    and only accepts audio drops.
+  - Dragging clips **below the last layer creates a new layer** on release
+    (ghost preview while hovering) — no pre-creating tracks to stack
+    another effect under the first. `clipDoubleClicked` host hook: open the
+    thing a block references (e.g. its effect graph) on double-click.
+  - Right-aligned **zoom cluster** on the toolbar (zoom out / 1:1 / zoom
+    in / fit content, view-center anchored; `F` and Ctrl+wheel still
+    work). Hosts with an icon font override `zoomOutLabel` /
+    `zoomOneLabel` / `zoomInLabel` / `zoomFitLabel`.
   - **Audio clips play back** (miniaudio) and draw their waveform (WAV: PCM
     8/16/24/32 & float32) with gain, media offset, **fade in/out handles** and
     **media looping** (tiling); left-trimming keeps the audio in place.
@@ -333,7 +361,7 @@ the same mechanism.
 | `Organic.h` | umbrella include |
 | `OrganicCore.h` | `Parameter`, `Container`, `Selection` (scopes/preselection), `linkInspectables`, `resolveParamAddress`, `UndoManager`, `Logger`, `OLOG` macros, `DrawParamWidget(Multi)`, `ParamPickerPopup` |
 | `OrganicManager.h` | `BaseItem`, `BaseManager` (factory, clipboard, undoable ops), `ManagerListUI`, `ManagerCanvasUI` |
-| `OrganicTimeline.h` | `SequenceManager`, `Sequence` (cues, loop range, play modes, ripple edits), `ClipLayer`/`Clip` (fades, media loop), `AutomationLayer` (easings, recorder), `GradientLayer`, `TriggerLayer`, `MediaPool`, `MediaPayload` |
+| `OrganicTimeline.h` | `SequenceManager`, `Sequence` (cues, loop range, play modes, ripple edits), `ClipLayer`/`Clip` (fades, media loop, overlap-free seating via `spanFree`/`resolveOverlap`), `ClipAutomation` (embedded per-clip curves/gradients, clip-local keys, host-fed recorder), `AutomationLayer` (easings, recorder, `applyDrawnPoints`), `GradientLayer`, `TriggerLayer`, `MediaPool`, `MediaPayload` |
 | `OrganicTimelineUI.h` | `TimelineUI` (the editor; `body()` for embedding, `gui()` for a window) |
 | `OrganicCurve2D.h` | `Curve2D` (arc-length 2D curves) + `Curve2DEditor` |
 | `OrganicPanels.h` | `InspectorPanel` (multi-edit), `OutlinerPanel`, `LoggerPanel`, `MediaPoolPanel`, `ScopePanel`, `Detective`/`DetectivePanel`, `CommitPendingParamEdits` |

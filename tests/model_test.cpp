@@ -103,6 +103,79 @@ static void testAutomation()
     CHECK(std::fabs(al->valueAt(3.0) - at30) < 2e-2);
 }
 
+static void testClipAutomations()
+{
+    // Timeline v2: automations live INSIDE the effect block, clip-local
+    Sequence seq("Seq");
+    auto* cl = static_cast<ClipLayer*>(seq.addLayer(Layer::LType::Clips, "FX"));
+    Clip* c = cl->addClip(Clip::CType::Block, "Wave", 2.0, 4.0);
+
+    ClipAutomation* a = c->addAutomation(ClipAutomation::AKind::Curve, "rate", "1:rate");
+    a->rangeMin = 0.f;
+    a->rangeMax = 2.f;
+    a->addKey(0.0, 0.f);
+    a->addKey(4.0, 2.f);
+    CHECK(std::fabs(a->valueAt(2.0) - 1.f) < 1e-4);          // clip-local eval
+    CHECK(c->findAutomationByTarget("1:rate") == a);
+
+    ClipAutomation* g = c->addAutomation(ClipAutomation::AKind::Gradient, "color", "2:color");
+    g->addGradKey(0.0, ImVec4(1, 0, 0, 1));
+    g->addGradKey(4.0, ImVec4(0, 1, 0, 1));
+    ImVec4 midC = g->colorAt(2.0);
+    CHECK(std::fabs(midC.x - 0.5f) < 1e-3 && std::fabs(midC.y - 0.5f) < 1e-3);
+
+    // moving the block costs nothing: locals are clip-relative by design
+    c->startP->setValue(6.f, false);
+    CHECK(std::fabs(a->valueAt(2.0) - 1.f) < 1e-4);
+
+    // keys can never outlive the block
+    a->addKey(9.0, 1.f);
+    c->clampAutomations();
+    CHECK(a->keys.size() == 2);
+
+    // serialization: automations ride the clip json
+    json snap = seq.save();
+    Sequence seq2("Seq2");
+    seq2.load(snap);
+    Clip* c2 = seq2.findClip(c->id);
+    CHECK(c2 && c2->automations.size() == 2);
+    CHECK(c2->findAutomationByTarget("1:rate") != nullptr);
+    CHECK(std::fabs(c2->findAutomationByTarget("1:rate")->valueAt(2.0) - 1.f) < 1e-4);
+
+    // pencil / drawn points: RDP-simplified keys replace the swept range
+    std::vector<std::pair<double, float>> stroke;
+    for (int i = 0; i <= 40; i++) stroke.push_back({ i * 0.1, (i % 2) ? 1.f : 0.9f });
+    a->applyDrawnPoints(stroke, 1, 0.05f);
+    CHECK(a->keys.size() >= 2);
+    CHECK(std::fabs(a->valueAt(2.0) - 0.95f) < 0.1f);
+
+    // host-fed recorder
+    ClipAutomation* r = c->addAutomation(ClipAutomation::AKind::Curve, "amount");
+    r->recArm = true;
+    for (int i = 0; i <= 20; i++) r->updateRecording(i * 0.1, i / 20.f);
+    r->stopRecordingAndApply();
+    CHECK(r->keys.size() >= 2);
+    CHECK(std::fabs(r->valueAt(2.0) - 1.f) < 0.1f);
+}
+
+static void testClipOverlapRules()
+{
+    // two blocks on one track must not overlap in time
+    Sequence seq("Seq");
+    auto* cl = static_cast<ClipLayer*>(seq.addLayer(Layer::LType::Clips, "FX"));
+    cl->addClip(Clip::CType::Block, "A", 2.0, 4.0); // 2..6
+    CHECK(cl->spanFree(0.0, 2.0));
+    CHECK(!cl->spanFree(1.0, 3.0));
+    CHECK(cl->spanFree(6.0, 8.0));
+    CHECK(std::fabs(cl->resolveOverlap(3.0, 2.0) - 6.0) < 1e-6 ||
+          std::fabs(cl->resolveOverlap(3.0, 2.0) - 0.0) < 1e-6); // flush seat
+    CHECK(std::fabs(cl->resolveOverlap(7.0, 2.0) - 7.0) < 1e-6); // free spot kept
+    // between two blocks, the gap that fits wins
+    cl->addClip(Clip::CType::Block, "B", 8.0, 4.0); // 8..12
+    double seat = cl->resolveOverlap(5.0, 2.0);
+    CHECK(std::fabs(seat - 6.0) < 1e-6); // the 6..8 gap
+}
+
 static void testRangeRemap()
 {
     Sequence seq("Seq");
@@ -334,6 +407,8 @@ int main()
     testCoreParams();
     testSelectionScopes();
     testSequenceStructure();
+    testClipAutomations();
+    testClipOverlapRules();
     testAutomation();
     testRangeRemap();
     testTriggersAndCues();

@@ -6,6 +6,461 @@
 namespace organic
 {
 
+// ================================================================ shared key math
+// One implementation for sequence AutomationLayers and embedded clip
+// automations — the curves must evaluate identically wherever they live.
+
+float autoKeysValueAt(const std::vector<AutoKey>& keys, float mn, float mx, double t)
+{
+    if (keys.empty()) return mn;
+    if (t <= keys.front().time) return keys.front().value;
+    if (t >= keys.back().time) return keys.back().value;
+    for (size_t i = 0; i + 1 < keys.size(); i++)
+    {
+        const AutoKey& a = keys[i];
+        const AutoKey& b = keys[i + 1];
+        if (t >= a.time && t <= b.time)
+        {
+            double span = b.time - a.time;
+            float w = span > 0 ? (float)((t - a.time) / span) : 1.f;
+            float range = (mx - mn) == 0 ? 1.f : (mx - mn);
+            // normalize for amplitude-based easings, then map back
+            float na = (a.value - mn) / range;
+            float nb = (b.value - mn) / range;
+            float nv = ease(a.easing, na, nb, w, a.ep);
+            return mn + nv * range;
+        }
+    }
+    return keys.back().value;
+}
+
+static void sortAutoKeys(std::vector<AutoKey>& keys)
+{
+    std::stable_sort(keys.begin(), keys.end(),
+                     [](const AutoKey& a, const AutoKey& b) { return a.time < b.time; });
+}
+
+uint64_t autoKeysInsertAt(std::vector<AutoKey>& keys, float mn, float mx, double t,
+                          const std::function<uint64_t()>& newId)
+{
+    auto plainAdd = [&](double kt, float v)
+    {
+        AutoKey k;
+        k.id = newId();
+        k.time = std::max(0.0, kt);
+        k.value = v;
+        keys.push_back(k);
+        sortAutoKeys(keys);
+        return k.id;
+    };
+
+    if (keys.size() < 2 || t <= keys.front().time || t >= keys.back().time)
+        return plainAdd(t, autoKeysValueAt(keys, mn, mx, t));
+
+    int seg = -1;
+    for (size_t i = 0; i + 1 < keys.size(); i++)
+        if (t >= keys[i].time && t <= keys[i + 1].time) { seg = (int)i; break; }
+    if (seg < 0) return plainAdd(t, autoKeysValueAt(keys, mn, mx, t));
+
+    AutoKey a = keys[seg];
+    AutoKey b = keys[seg + 1];
+    float range = (mx - mn) == 0 ? 1.f : (mx - mn);
+
+    if (a.easing == EasingType::Bezier)
+    {
+        // split preserving shape, in (time, normValue) space
+        double segDur = std::max(1e-6, b.time - a.time);
+        float na = (a.value - mn) / range, nb = (b.value - mn) / range;
+        ImVec2 p0((float)a.time, na);
+        ImVec2 c1((float)(a.time + a.ep.a1.x * segDur), na + a.ep.a1.y);
+        ImVec2 c2((float)(b.time + a.ep.a2.x * segDur), nb + a.ep.a2.y);
+        ImVec2 p3((float)b.time, nb);
+
+        // solve bezier parameter for x = t (x is monotonic since anchors are clamped)
+        float lo = 0.f, hi = 1.f, bt = 0.5f;
+        for (int i = 0; i < 28; i++)
+        {
+            bt = 0.5f * (lo + hi);
+            float it = 1.f - bt;
+            float x = it * it * it * p0.x + 3 * it * it * bt * c1.x + 3 * it * bt * bt * c2.x + bt * bt * bt * p3.x;
+            if (x < t) lo = bt; else hi = bt;
+        }
+        ImVec2 l1, l2, mid, r1, r2;
+        splitCubic(p0, c1, c2, p3, bt, l1, l2, mid, r1, r2);
+
+        AutoKey nk;
+        nk.id = newId();
+        nk.time = mid.x;
+        nk.value = mn + mid.y * range;
+        nk.easing = EasingType::Bezier;
+        double d1 = std::max(1e-6, (double)mid.x - a.time);
+        double d2 = std::max(1e-6, (double)b.time - mid.x);
+        AutoKey& ka = keys[seg];
+        ka.ep.a1 = ImVec2((float)((l1.x - a.time) / d1), l1.y - na);
+        ka.ep.a2 = ImVec2((float)((l2.x - mid.x) / d1), l2.y - mid.y);
+        nk.ep.a1 = ImVec2((float)((r1.x - mid.x) / d2), r1.y - mid.y);
+        nk.ep.a2 = ImVec2((float)((r2.x - b.time) / d2), r2.y - nb);
+        keys.insert(keys.begin() + seg + 1, nk);
+        sortAutoKeys(keys);
+        return nk.id;
+    }
+
+    // other easings: keep the segment type, value from the curve
+    AutoKey nk;
+    nk.id = newId();
+    nk.time = t;
+    nk.value = autoKeysValueAt(keys, mn, mx, t);
+    nk.easing = a.easing;
+    nk.ep = a.ep;
+    keys.insert(keys.begin() + seg + 1, nk);
+    sortAutoKeys(keys);
+    return nk.id;
+}
+
+void autoKeysReplaceRange(std::vector<AutoKey>& keys, float mn, float mx,
+                          const std::vector<std::pair<double, float>>& recPoints,
+                          int method, float tol,
+                          const std::function<uint64_t()>& newId)
+{
+    if (recPoints.size() < 2) return;
+    double t0 = recPoints.front().first;
+    double t1 = recPoints.back().first;
+    keys.erase(std::remove_if(keys.begin(), keys.end(),
+               [t0, t1](const AutoKey& k) { return k.time >= t0 && k.time <= t1; }), keys.end());
+
+    float range = (mx - mn) == 0 ? 1.f : (mx - mn);
+    double dur = std::max(1e-6, t1 - t0);
+
+    auto addK = [&](double kt, float v, EasingType e)
+    {
+        AutoKey k;
+        k.id = newId();
+        k.time = std::max(0.0, kt);
+        k.value = std::max(std::min(mn, mx), std::min(std::max(mn, mx), v));
+        k.easing = e;
+        keys.push_back(k);
+        return &keys.back();
+    };
+
+    // normalized point cloud (x: 0..1 over recorded span, y: 0..1 over range)
+    std::vector<ImVec2> pts;
+    pts.reserve(recPoints.size());
+    for (auto& rp : recPoints)
+        pts.push_back(ImVec2((float)((rp.first - t0) / dur), (rp.second - mn) / range));
+
+    if (method == 0) // raw points, decimated
+    {
+        int step = std::max(1, (int)(recPoints.size() / std::max(2.0, dur * 20.0)));
+        for (size_t i = 0; i < recPoints.size(); i += step)
+            addK(recPoints[i].first, recPoints[i].second, EasingType::Linear);
+        addK(t1, recPoints.back().second, EasingType::Linear);
+    }
+    else if (method == 1) // RDP
+    {
+        std::vector<int> keep;
+        simplifyRDP(pts, std::max(0.0015f, tol * 0.06f), keep);
+        for (int idx : keep)
+            addK(recPoints[idx].first, recPoints[idx].second, EasingType::Linear);
+    }
+    else // bezier fit
+    {
+        std::vector<FittedCubic> cubics;
+        fitCubicBeziers(pts, std::max(0.002f, tol * 0.08f), cubics);
+        for (size_t i = 0; i < cubics.size(); i++)
+        {
+            const FittedCubic& b = cubics[i];
+            double kt = t0 + b.p0.x * dur;
+            AutoKey* k = addK(kt, mn + b.p0.y * range, EasingType::Bezier);
+            float dx = std::max(1e-6f, b.p3.x - b.p0.x);
+            k->ep.a1 = ImVec2(std::max(0.f, std::min(1.f, (b.c1.x - b.p0.x) / dx)), b.c1.y - b.p0.y);
+            k->ep.a2 = ImVec2(std::max(-1.f, std::min(0.f, (b.c2.x - b.p3.x) / dx)), b.c2.y - b.p3.y);
+        }
+        addK(t1, mn + cubics.back().p3.y * range, EasingType::Linear);
+    }
+    sortAutoKeys(keys);
+}
+
+ImVec4 gradKeysColorAt(const std::vector<GradKey>& keys, double t)
+{
+    if (keys.empty()) return ImVec4(0, 0, 0, 1);
+    if (t <= keys.front().time) return keys.front().color;
+    if (t >= keys.back().time) return keys.back().color;
+    for (size_t i = 0; i + 1 < keys.size(); i++)
+    {
+        const GradKey& a = keys[i];
+        const GradKey& b = keys[i + 1];
+        if (t >= a.time && t <= b.time)
+        {
+            if (a.hold) return a.color; // NONE interpolation
+            double span = b.time - a.time;
+            float w = span > 0 ? (float)((t - a.time) / span) : 1.f;
+            return ImVec4(a.color.x + (b.color.x - a.color.x) * w,
+                          a.color.y + (b.color.y - a.color.y) * w,
+                          a.color.z + (b.color.z - a.color.z) * w,
+                          a.color.w + (b.color.w - a.color.w) * w);
+        }
+    }
+    return keys.back().color;
+}
+
+json autoKeysToJson(const std::vector<AutoKey>& keys)
+{
+    json arr = json::array();
+    for (auto& k : keys)
+        arr.push_back({ { "id", k.id }, { "t", k.time }, { "v", k.value },
+                        { "e", (int)k.easing }, { "ep", k.ep.toJson() } });
+    return arr;
+}
+
+void autoKeysFromJson(std::vector<AutoKey>& keys, const json& arr,
+                      const std::function<uint64_t()>& newId, uint64_t* maxId)
+{
+    keys.clear();
+    if (!arr.is_array()) return;
+    for (auto& kj : arr)
+    {
+        AutoKey k;
+        k.id     = kj.value("id", (uint64_t)0);
+        k.time   = kj.value("t", 0.0);
+        k.value  = kj.value("v", 0.f);
+        k.easing = (EasingType)kj.value("e", 0);
+        if (kj.contains("ep")) k.ep.fromJson(kj["ep"]);
+        if (k.id == 0) k.id = newId();
+        if (maxId) *maxId = std::max(*maxId, k.id + 1);
+        keys.push_back(k);
+    }
+    sortAutoKeys(keys);
+}
+
+json gradKeysToJson(const std::vector<GradKey>& keys)
+{
+    json arr = json::array();
+    for (auto& k : keys)
+        arr.push_back({ { "id", k.id }, { "t", k.time }, { "hold", k.hold },
+                        { "c", { k.color.x, k.color.y, k.color.z, k.color.w } } });
+    return arr;
+}
+
+void gradKeysFromJson(std::vector<GradKey>& keys, const json& arr,
+                      const std::function<uint64_t()>& newId, uint64_t* maxId)
+{
+    keys.clear();
+    if (!arr.is_array()) return;
+    for (auto& kj : arr)
+    {
+        GradKey k;
+        k.id = kj.value("id", (uint64_t)0);
+        k.time = kj.value("t", 0.0);
+        k.hold = kj.value("hold", false);
+        if (kj.contains("c"))
+            k.color = ImVec4(kj["c"][0], kj["c"][1], kj["c"][2], kj["c"][3]);
+        if (k.id == 0) k.id = newId();
+        if (maxId) *maxId = std::max(*maxId, k.id + 1);
+        keys.push_back(k);
+    }
+    std::stable_sort(keys.begin(), keys.end(),
+                     [](const GradKey& a, const GradKey& b) { return a.time < b.time; });
+}
+
+// ================================================================ ClipAutomation
+ClipAutomation::ClipAutomation(Clip* owner, AKind kind, const std::string& n)
+    : clip(owner), akind(kind), name(n)
+{
+    // deterministic per-name hue so every row of a block reads distinct
+    uint32_t h = 2166136261u;
+    for (unsigned char c : n) { h ^= c; h *= 16777619u; }
+    float hue = (h % 360) / 360.f;
+    float r, g, b;
+    ImGui::ColorConvertHSVtoRGB(hue, 0.62f, 0.92f, r, g, b);
+    color = ImVec4(r, g, b, 1.f);
+}
+
+uint64_t ClipAutomation::newId() const
+{
+    if (clip && clip->layer && clip->layer->sequence)
+        return clip->layer->sequence->newId();
+    static uint64_t fallback = 1u << 20; // detached (tests)
+    return fallback++;
+}
+
+float ClipAutomation::valueAt(double localT) const
+{
+    return autoKeysValueAt(keys, rangeMin, rangeMax, localT);
+}
+
+float ClipAutomation::normValueAt(double localT) const
+{
+    float range = (rangeMax - rangeMin) == 0 ? 1.f : (rangeMax - rangeMin);
+    return (valueAt(localT) - rangeMin) / range;
+}
+
+ImVec4 ClipAutomation::colorAt(double localT) const
+{
+    return gradKeysColorAt(gkeys, localT);
+}
+
+AutoKey* ClipAutomation::addKey(double t, float v, EasingType e)
+{
+    AutoKey k;
+    k.id = newId();
+    k.time = std::max(0.0, t);
+    k.value = v;
+    k.easing = e;
+    keys.push_back(k);
+    sortKeys();
+    return findKey(k.id);
+}
+
+AutoKey* ClipAutomation::insertKeyAt(double t)
+{
+    uint64_t id = autoKeysInsertAt(keys, rangeMin, rangeMax, t,
+                                   [this] { return newId(); });
+    return findKey(id);
+}
+
+AutoKey* ClipAutomation::findKey(uint64_t kid)
+{
+    for (auto& k : keys) if (k.id == kid) return &k;
+    return nullptr;
+}
+
+GradKey* ClipAutomation::addGradKey(double t, ImVec4 c)
+{
+    GradKey k;
+    k.id = newId();
+    k.time = std::max(0.0, t);
+    k.color = c;
+    gkeys.push_back(k);
+    sortKeys();
+    return findGradKey(k.id);
+}
+
+GradKey* ClipAutomation::findGradKey(uint64_t kid)
+{
+    for (auto& k : gkeys) if (k.id == kid) return &k;
+    return nullptr;
+}
+
+void ClipAutomation::removeKey(uint64_t kid)
+{
+    keys.erase(std::remove_if(keys.begin(), keys.end(),
+               [kid](const AutoKey& k) { return k.id == kid; }), keys.end());
+    gkeys.erase(std::remove_if(gkeys.begin(), gkeys.end(),
+                [kid](const GradKey& k) { return k.id == kid; }), gkeys.end());
+    selectedKeys.erase(kid);
+}
+
+void ClipAutomation::sortKeys()
+{
+    sortAutoKeys(keys);
+    std::stable_sort(gkeys.begin(), gkeys.end(),
+                     [](const GradKey& a, const GradKey& b) { return a.time < b.time; });
+}
+
+void ClipAutomation::clampToClip()
+{
+    if (!clip) return;
+    const double len = clip->length();
+    keys.erase(std::remove_if(keys.begin(), keys.end(),
+               [len](const AutoKey& k) { return k.time < -1e-9 || k.time > len + 1e-9; }),
+               keys.end());
+    gkeys.erase(std::remove_if(gkeys.begin(), gkeys.end(),
+                [len](const GradKey& k) { return k.time < -1e-9 || k.time > len + 1e-9; }),
+                gkeys.end());
+}
+
+void ClipAutomation::applyDrawnPoints(const std::vector<std::pair<double, float>>& pts,
+                                      int method, float tol)
+{
+    autoKeysReplaceRange(keys, rangeMin, rangeMax, pts, method, tol,
+                         [this] { return newId(); });
+    clampToClip();
+}
+
+void ClipAutomation::updateRecording(double localT, float value)
+{
+    if (!recArm)
+    {
+        if (recording) stopRecordingAndApply();
+        return;
+    }
+    if (!recording)
+    {
+        recording = true;
+        recPoints.clear();
+        OLOG(name, "Recording into clip automation");
+    }
+    if (!recPoints.empty() && localT < recPoints.back().first - 1e-6)
+    {
+        stopRecordingAndApply(); // transport wrapped / left the clip
+        return;
+    }
+    float v = std::max(std::min(rangeMin, rangeMax),
+                       std::min(std::max(rangeMin, rangeMax), value));
+    if (recPoints.empty() || localT - recPoints.back().first >= 0.004)
+        recPoints.push_back({ localT, v });
+}
+
+void ClipAutomation::stopRecordingAndApply()
+{
+    recording = false;
+    recArm = false;
+    if (recPoints.size() < 2) { recPoints.clear(); return; }
+    // bezier fit like organic's recorder default — smooth takes, few keys
+    applyDrawnPoints(recPoints, 2, 0.1f);
+    recPoints.clear();
+    OLOG(name, "Recorded " << keys.size() << " key(s)");
+}
+
+json ClipAutomation::keysToJson() const
+{
+    return akind == AKind::Gradient ? gradKeysToJson(gkeys) : autoKeysToJson(keys);
+}
+
+void ClipAutomation::keysFromJson(const json& arr)
+{
+    selectedKeys.clear();
+    uint64_t* maxId = nullptr;
+    Sequence* seq = (clip && clip->layer) ? clip->layer->sequence : nullptr;
+    if (seq) maxId = &seq->nextId;
+    if (akind == AKind::Gradient)
+        gradKeysFromJson(gkeys, arr, [this] { return newId(); }, maxId);
+    else
+        autoKeysFromJson(keys, arr, [this] { return newId(); }, maxId);
+}
+
+json ClipAutomation::save() const
+{
+    json j;
+    j["id"] = id;
+    j["kind"] = akind == AKind::Gradient ? "gradient" : "curve";
+    j["name"] = name;
+    j["target"] = target;
+    j["color"] = { color.x, color.y, color.z, color.w };
+    j["rangeMin"] = rangeMin;
+    j["rangeMax"] = rangeMax;
+    j["expanded"] = expanded;
+    j["keys"] = keysToJson();
+    return j;
+}
+
+void ClipAutomation::load(const json& j)
+{
+    if (j.contains("id")) id = j["id"].get<uint64_t>();
+    akind = j.value("kind", "curve") == std::string("gradient") ? AKind::Gradient
+                                                                : AKind::Curve;
+    name = j.value("name", name);
+    target = j.value("target", "");
+    if (j.contains("color") && j["color"].is_array() && j["color"].size() >= 3)
+        color = ImVec4(j["color"][0], j["color"][1], j["color"][2],
+                       j["color"].size() > 3 ? (float)j["color"][3] : 1.f);
+    rangeMin = j.value("rangeMin", 0.f);
+    rangeMax = j.value("rangeMax", 1.f);
+    expanded = j.value("expanded", false);
+    uiAnim = -1.f;
+    if (j.contains("keys")) keysFromJson(j["keys"]);
+}
+
 // ================================================================ Clip
 Clip::Clip(ClipLayer* l, CType t, const std::string& name)
     : Container(name, l), layer(l), ctype(t)
@@ -60,6 +515,49 @@ void Clip::setAudioFile(const std::string& path, bool adjustLength)
         lengthP->setValue((float)asset->buffer.duration());
 }
 
+ClipAutomation* Clip::addAutomation(ClipAutomation::AKind kind,
+                                    const std::string& name,
+                                    const std::string& target)
+{
+    auto a = std::make_unique<ClipAutomation>(this, kind, name);
+    a->target = target;
+    a->id = layer && layer->sequence ? layer->sequence->newId() : (uint64_t)automations.size() + 1;
+    ClipAutomation* raw = a.get();
+    automations.push_back(std::move(a));
+    return raw;
+}
+
+ClipAutomation* Clip::findAutomation(uint64_t aid) const
+{
+    for (auto& a : automations) if (a->id == aid) return a.get();
+    return nullptr;
+}
+
+ClipAutomation* Clip::findAutomationByTarget(const std::string& target) const
+{
+    for (auto& a : automations) if (a->target == target) return a.get();
+    return nullptr;
+}
+
+json Clip::removeAutomation(uint64_t aid)
+{
+    for (size_t i = 0; i < automations.size(); i++)
+    {
+        if (automations[i]->id == aid)
+        {
+            json j = automations[i]->save();
+            automations.erase(automations.begin() + i);
+            return j;
+        }
+    }
+    return json();
+}
+
+void Clip::clampAutomations()
+{
+    for (auto& a : automations) a->clampToClip();
+}
+
 void Clip::onParamChanged(Parameter* p)
 {
     if (p == startP && p->floatValue() < 0) p->setValue(0.f, false);
@@ -92,6 +590,12 @@ json Clip::save() const
     json j = Container::save();
     j["id"]    = id;
     j["ctype"] = ctype == CType::Audio ? "audio" : "block";
+    if (!automations.empty())
+    {
+        json arr = json::array();
+        for (auto& a : automations) arr.push_back(a->save());
+        j["autos"] = arr;
+    }
     return j;
 }
 
@@ -99,6 +603,19 @@ void Clip::load(const json& j)
 {
     Container::load(j);
     if (j.contains("id")) id = j["id"].get<uint64_t>();
+    automations.clear();
+    if (j.contains("autos"))
+    {
+        for (auto& aj : j["autos"])
+        {
+            ClipAutomation* a = addAutomation(ClipAutomation::AKind::Curve,
+                                              aj.value("name", "Automation"));
+            a->load(aj);
+            if (a->id == 0 && layer && layer->sequence) a->id = layer->sequence->newId();
+            if (layer && layer->sequence)
+                layer->sequence->nextId = std::max(layer->sequence->nextId, a->id + 1);
+        }
+    }
     if (ctype == CType::Audio && fileP && !fileP->stringValue().empty())
         asset = AudioCache::get().load(fileP->stringValue());
 }
@@ -205,6 +722,56 @@ void ClipLayer::sortClips()
                      { return a->start() < b->start(); });
 }
 
+bool ClipLayer::spanFree(double t0, double t1, const std::vector<uint64_t>& ignore) const
+{
+    const double eps = 1e-6;
+    for (auto& c : clips)
+    {
+        bool ignored = false;
+        for (uint64_t ig : ignore) if (ig == c->id) ignored = true;
+        if (ignored) continue;
+        if (c->start() < t1 - eps && c->end() > t0 + eps) return false;
+    }
+    return true;
+}
+
+double ClipLayer::resolveOverlap(double t, double len, const std::vector<uint64_t>& ignore) const
+{
+    t = std::max(0.0, t);
+    if (spanFree(t, t + len, ignore)) return t;
+
+    // candidate seats: flush against every neighbour edge (before/after),
+    // pick the nearest legal one — blocks butt together, never stack
+    std::vector<double> cands;
+    for (auto& c : clips)
+    {
+        bool ignored = false;
+        for (uint64_t ig : ignore) if (ig == c->id) ignored = true;
+        if (ignored) continue;
+        cands.push_back(c->end());          // right after this clip
+        cands.push_back(c->start() - len);  // right before this clip
+    }
+    cands.push_back(0.0);
+    double best = -1, bestD = 1e18;
+    for (double c : cands)
+    {
+        if (c < 0) continue;
+        if (!spanFree(c, c + len, ignore)) continue;
+        double d = std::fabs(c - t);
+        if (d < bestD) { bestD = d; best = c; }
+    }
+    if (best >= 0) return best;
+    // fall back: after the last clip
+    double last = 0;
+    for (auto& c : clips)
+    {
+        bool ignored = false;
+        for (uint64_t ig : ignore) if (ig == c->id) ignored = true;
+        if (!ignored) last = std::max(last, c->end());
+    }
+    return last;
+}
+
 json ClipLayer::save() const
 {
     json j = Layer::save();
@@ -269,69 +836,10 @@ void AutomationLayer::onParamChanged(Parameter* p)
 
 AutoKey* AutomationLayer::insertKeyAt(double t)
 {
-    if (keys.size() < 2 || t <= keys.front().time || t >= keys.back().time)
-        return addKey(t, valueAt(t));
-
-    // find segment
-    int seg = -1;
-    for (size_t i = 0; i + 1 < keys.size(); i++)
-        if (t >= keys[i].time && t <= keys[i + 1].time) { seg = (int)i; break; }
-    if (seg < 0) return addKey(t, valueAt(t));
-
-    AutoKey a = keys[seg];
-    AutoKey b = keys[seg + 1];
-    float mn = rangeMinP->floatValue(), mx = rangeMaxP->floatValue();
-    float range = (mx - mn) == 0 ? 1.f : (mx - mn);
-
-    if (a.easing == EasingType::Bezier)
-    {
-        // split preserving shape, in (time, normValue) space
-        double segDur = std::max(1e-6, b.time - a.time);
-        float na = (a.value - mn) / range, nb = (b.value - mn) / range;
-        ImVec2 p0((float)a.time, na);
-        ImVec2 c1((float)(a.time + a.ep.a1.x * segDur), na + a.ep.a1.y);
-        ImVec2 c2((float)(b.time + a.ep.a2.x * segDur), nb + a.ep.a2.y);
-        ImVec2 p3((float)b.time, nb);
-
-        // solve bezier parameter for x = t (x is monotonic since anchors are clamped)
-        float lo = 0.f, hi = 1.f, bt = 0.5f;
-        for (int i = 0; i < 28; i++)
-        {
-            bt = 0.5f * (lo + hi);
-            float it = 1.f - bt;
-            float x = it * it * it * p0.x + 3 * it * it * bt * c1.x + 3 * it * bt * bt * c2.x + bt * bt * bt * p3.x;
-            if (x < t) lo = bt; else hi = bt;
-        }
-        ImVec2 l1, l2, mid, r1, r2;
-        splitCubic(p0, c1, c2, p3, bt, l1, l2, mid, r1, r2);
-
-        AutoKey nk;
-        nk.id = sequence->newId();
-        nk.time = mid.x;
-        nk.value = mn + mid.y * range;
-        nk.easing = EasingType::Bezier;
-        double d1 = std::max(1e-6, (double)mid.x - a.time);
-        double d2 = std::max(1e-6, (double)b.time - mid.x);
-        AutoKey& ka = keys[seg];
-        ka.ep.a1 = ImVec2((float)((l1.x - a.time) / d1), l1.y - na);
-        ka.ep.a2 = ImVec2((float)((l2.x - mid.x) / d1), l2.y - mid.y);
-        nk.ep.a1 = ImVec2((float)((r1.x - mid.x) / d2), r1.y - mid.y);
-        nk.ep.a2 = ImVec2((float)((r2.x - b.time) / d2), r2.y - nb);
-        keys.insert(keys.begin() + seg + 1, nk);
-        sortKeys();
-        return findKey(nk.id);
-    }
-
-    // other easings: keep the segment type, value from the curve
-    AutoKey nk;
-    nk.id = sequence->newId();
-    nk.time = t;
-    nk.value = valueAt(t);
-    nk.easing = a.easing;
-    nk.ep = a.ep;
-    keys.insert(keys.begin() + seg + 1, nk);
-    sortKeys();
-    return findKey(nk.id);
+    uint64_t id = autoKeysInsertAt(keys, rangeMinP->floatValue(),
+                                   rangeMaxP->floatValue(), t,
+                                   [this] { return sequence->newId(); });
+    return findKey(id);
 }
 
 void AutomationLayer::updateRecording(double t)
@@ -373,54 +881,9 @@ void AutomationLayer::stopRecordingAndApply()
     if (recPoints.size() < 2) { recPoints.clear(); return; }
 
     json pre = keysToJson();
-    double t0 = recPoints.front().first;
-    double t1 = recPoints.back().first;
-    keys.erase(std::remove_if(keys.begin(), keys.end(),
-               [t0, t1](const AutoKey& k) { return k.time >= t0 && k.time <= t1; }), keys.end());
-
-    float mn = rangeMinP->floatValue(), mx = rangeMaxP->floatValue();
-    float range = (mx - mn) == 0 ? 1.f : (mx - mn);
-    double dur = std::max(1e-6, t1 - t0);
-
-    // normalized point cloud (x: 0..1 over recorded span, y: 0..1 over range)
-    std::vector<ImVec2> pts;
-    pts.reserve(recPoints.size());
-    for (auto& rp : recPoints)
-        pts.push_back(ImVec2((float)((rp.first - t0) / dur), (rp.second - mn) / range));
-
-    int method = recSimplifyP->intValue();
-    float tol = recTolP->floatValue();
-
-    if (method == 0) // raw points, decimated
-    {
-        int step = std::max(1, (int)(recPoints.size() / std::max(2.0, dur * 20.0)));
-        for (size_t i = 0; i < recPoints.size(); i += step)
-            addKey(recPoints[i].first, recPoints[i].second, EasingType::Linear);
-        addKey(t1, recPoints.back().second, EasingType::Linear);
-    }
-    else if (method == 1) // RDP
-    {
-        std::vector<int> keep;
-        simplifyRDP(pts, std::max(0.0015f, tol * 0.06f), keep);
-        for (int idx : keep)
-            addKey(recPoints[idx].first, recPoints[idx].second, EasingType::Linear);
-    }
-    else // bezier fit
-    {
-        std::vector<FittedCubic> cubics;
-        fitCubicBeziers(pts, std::max(0.002f, tol * 0.08f), cubics);
-        for (size_t i = 0; i < cubics.size(); i++)
-        {
-            const FittedCubic& b = cubics[i];
-            double kt = t0 + b.p0.x * dur;
-            AutoKey* k = addKey(kt, mn + b.p0.y * range, EasingType::Bezier);
-            float dx = std::max(1e-6f, b.p3.x - b.p0.x);
-            k->ep.a1 = ImVec2(std::max(0.f, std::min(1.f, (b.c1.x - b.p0.x) / dx)), b.c1.y - b.p0.y);
-            k->ep.a2 = ImVec2(std::max(-1.f, std::min(0.f, (b.c2.x - b.p3.x) / dx)), b.c2.y - b.p3.y);
-        }
-        addKey(t1, mn + cubics.back().p3.y * range, EasingType::Linear);
-    }
-    sortKeys();
+    autoKeysReplaceRange(keys, rangeMinP->floatValue(), rangeMaxP->floatValue(),
+                         recPoints, recSimplifyP->intValue(), recTolP->floatValue(),
+                         [this] { return sequence->newId(); });
     recPoints.clear();
 
     json post = keysToJson();
@@ -432,29 +895,16 @@ void AutomationLayer::stopRecordingAndApply()
     OLOG(niceName, "Recorded " << keys.size() << " key(s)");
 }
 
+void AutomationLayer::applyDrawnPoints(const std::vector<std::pair<double, float>>& pts,
+                                       int method, float tol)
+{
+    autoKeysReplaceRange(keys, rangeMinP->floatValue(), rangeMaxP->floatValue(),
+                         pts, method, tol, [this] { return sequence->newId(); });
+}
+
 float AutomationLayer::valueAt(double t) const
 {
-    float mn = rangeMinP->floatValue(), mx = rangeMaxP->floatValue();
-    if (keys.empty()) return mn;
-    if (t <= keys.front().time) return keys.front().value;
-    if (t >= keys.back().time) return keys.back().value;
-    for (size_t i = 0; i + 1 < keys.size(); i++)
-    {
-        const AutoKey& a = keys[i];
-        const AutoKey& b = keys[i + 1];
-        if (t >= a.time && t <= b.time)
-        {
-            double span = b.time - a.time;
-            float w = span > 0 ? (float)((t - a.time) / span) : 1.f;
-            float range = (mx - mn) == 0 ? 1.f : (mx - mn);
-            // normalize for amplitude-based easings, then map back
-            float na = (a.value - mn) / range;
-            float nb = (b.value - mn) / range;
-            float nv = ease(a.easing, na, nb, w, a.ep);
-            return mn + nv * range;
-        }
-    }
-    return keys.back().value;
+    return autoKeysValueAt(keys, rangeMinP->floatValue(), rangeMaxP->floatValue(), t);
 }
 
 float AutomationLayer::normValueAt(double t) const
@@ -641,25 +1091,7 @@ GradientLayer::GradientLayer(Sequence* s, const std::string& name)
 
 ImVec4 GradientLayer::colorAt(double t) const
 {
-    if (keys.empty()) return ImVec4(0, 0, 0, 1);
-    if (t <= keys.front().time) return keys.front().color;
-    if (t >= keys.back().time) return keys.back().color;
-    for (size_t i = 0; i + 1 < keys.size(); i++)
-    {
-        const GradKey& a = keys[i];
-        const GradKey& b = keys[i + 1];
-        if (t >= a.time && t <= b.time)
-        {
-            if (a.hold) return a.color; // NONE interpolation
-            double span = b.time - a.time;
-            float w = span > 0 ? (float)((t - a.time) / span) : 1.f;
-            return ImVec4(a.color.x + (b.color.x - a.color.x) * w,
-                          a.color.y + (b.color.y - a.color.y) * w,
-                          a.color.z + (b.color.z - a.color.z) * w,
-                          a.color.w + (b.color.w - a.color.w) * w);
-        }
-    }
-    return keys.back().color;
+    return gradKeysColorAt(keys, t);
 }
 
 GradKey* GradientLayer::addKey(double t, ImVec4 c)
@@ -994,8 +1426,14 @@ void Sequence::stop()
     direction = 1;
     setTime(0);
     for (auto& l : layers)
+    {
         if (auto* al = dynamic_cast<AutomationLayer*>(l.get()))
             if (al->recording) al->stopRecordingAndApply();
+        if (auto* cl = dynamic_cast<ClipLayer*>(l.get()))
+            for (auto& c : cl->clips)
+                for (auto& a : c->automations)
+                    if (a->recording) a->stopRecordingAndApply();
+    }
 }
 
 void Sequence::setTime(double t)
@@ -1016,8 +1454,14 @@ void Sequence::update(double dt)
     if (!playing)
     {
         for (auto& l : layers)
+        {
             if (auto* al = dynamic_cast<AutomationLayer*>(l.get()))
                 if (al->recording) al->stopRecordingAndApply();
+            if (auto* cl = dynamic_cast<ClipLayer*>(l.get()))
+                for (auto& c : cl->clips)
+                    for (auto& a : c->automations)
+                        if (a->recording) a->stopRecordingAndApply();
+        }
         return;
     }
 
@@ -1220,9 +1664,28 @@ void Sequence::removeTimespan(double t0, double t1)
                 if (s >= t0 && e <= t1) { cl->clips.erase(cl->clips.begin() + i); continue; }
                 if (s >= t1) c->startP->setValue((float)(s - d), false);
                 else if (s < t0 && e > t1)      // straddles the whole span
+                {
                     c->lengthP->setValue((float)(c->length() - d), false);
+                    // embedded automations: cut the local window, close the gap
+                    const double l0 = t0 - s, l1 = t1 - s;
+                    for (auto& a : c->automations)
+                    {
+                        a->keys.erase(std::remove_if(a->keys.begin(), a->keys.end(),
+                                      [l0, l1](const AutoKey& k) { return k.time >= l0 && k.time <= l1; }),
+                                      a->keys.end());
+                        for (auto& k : a->keys) if (k.time > l1) k.time -= d;
+                        a->gkeys.erase(std::remove_if(a->gkeys.begin(), a->gkeys.end(),
+                                       [l0, l1](const GradKey& k) { return k.time >= l0 && k.time <= l1; }),
+                                       a->gkeys.end());
+                        for (auto& k : a->gkeys) if (k.time > l1) k.time -= d;
+                        a->sortKeys();
+                    }
+                }
                 else if (s < t0 && e > t0)      // tail inside the span
+                {
                     c->lengthP->setValue((float)(t0 - s), false);
+                    c->clampAutomations();
+                }
                 else if (s >= t0 && e > t1)     // head inside the span
                 {
                     double cut = t1 - s;
@@ -1230,6 +1693,15 @@ void Sequence::removeTimespan(double t0, double t1)
                     c->lengthP->setValue((float)(c->length() - cut), false);
                     if (c->ctype == Clip::CType::Audio)
                         c->offsetP->setValue((float)(c->offsetP->floatValue() + cut), false);
+                    // embedded automations stay glued to the timeline: shift
+                    // locals back by the cut, drop what fell off the front
+                    for (auto& a : c->automations)
+                    {
+                        for (auto& k : a->keys)  k.time -= cut;
+                        for (auto& k : a->gkeys) k.time -= cut;
+                        a->clampToClip();
+                        a->sortKeys();
+                    }
                 }
             }
             cl->sortClips();
@@ -1288,6 +1760,12 @@ void Sequence::onParamChanged(Parameter* p)
                     {
                         c->startP->setValue((float)(c->start() * f), false);
                         c->lengthP->setValue((float)(c->length() * f), false);
+                        // clip-local automation keys stretch with the block
+                        for (auto& a : c->automations)
+                        {
+                            for (auto& k : a->keys)  k.time *= f;
+                            for (auto& k : a->gkeys) k.time *= f;
+                        }
                     }
                 else if (auto* al = dynamic_cast<AutomationLayer*>(l.get()))
                     for (auto& k : al->keys) k.time *= f;
