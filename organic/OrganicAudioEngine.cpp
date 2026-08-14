@@ -2,8 +2,11 @@
 #include "OrganicTimeline.h"
 #include "OrganicCore.h"
 
+// Decoding stays ON: ma_decoder gives AudioCache native WAV/FLAC/MP3
+// (dr_wav/dr_flac/dr_mp3 are embedded in miniaudio — public domain).
+// Formats beyond that (AIFF/ALAC/AAC/OGG/…) go through the host-injected
+// AudioCache::decodeFallback, see OrganicAudio.h.
 #define MA_NO_ENCODING
-#define MA_NO_DECODING
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
 

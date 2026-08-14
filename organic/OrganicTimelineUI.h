@@ -126,6 +126,7 @@ private:
     // context menu / rename targets
     uint64_t ctxLayerId = 0, ctxItemId = 0;
     uint64_t ctxClipId = 0, ctxAutoId = 0; // embedded automation targets
+    int ctxAaRow = -1, ctxAaSection = -1;  // audio structure row targets
     double   ctxTime = 0;
     float    ctxValue = 0;
     char     renameBuf[128] = {};

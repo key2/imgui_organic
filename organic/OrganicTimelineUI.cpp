@@ -63,7 +63,9 @@ struct Hit
         KeyBoxL, KeyBoxR, KeyBoxT, KeyBoxB, KeyBoxMove,
         // embedded clip-automation rows
         CAHeader, CAArm, CAKey, CABezA1, CABezA2, CAEase, CAGKey,
-        CACurve, CAGrad
+        CACurve, CAGrad,
+        // audio structure rows (host-fed analysis under the waveform)
+        AAHeader, AASection
     };
     Kind   kind = None;
     Layer* layer = nullptr;
@@ -71,6 +73,8 @@ struct Hit
     Clip*  clip = nullptr;
     ClipAutomation* cauto = nullptr;
     uint64_t keyId = 0;
+    int    aaRow = -1;     // 0 = EDM row, 1 = SONG row
+    int    aaSection = -1; // section index within the row
 };
 
 // ---------------------------------------------------------------- embedded automation rows
@@ -98,9 +102,17 @@ static float caRowsHeight(const Clip& c)
 }
 
 // content height a Block clip wants (title + rows); clips without
-// automations keep the classic full-lane look
+// automations keep the classic full-lane look. Audio clips grow for their
+// structure-analysis rows (waveform keeps its band above them).
+static float aaRowsHeight(const Clip& c); // fwd (audio structure rows, below)
 static float clipDesiredH(const Clip& c)
 {
+    if (c.ctype == Clip::CType::Audio)
+    {
+        float rows = aaRowsHeight(c);
+        if (rows <= 0) return 0; // classic full-lane waveform
+        return ImGui::GetFontSize() + 6 + 40.f /*AA_WAVE_MIN*/ + rows + 4.f;
+    }
     if (c.ctype != Clip::CType::Block || c.automations.empty()) return 0;
     return CA_TITLE_H + caRowsHeight(c) + 4.f;
 }
@@ -142,6 +154,117 @@ static float caRowYToNorm(const AutoRowGeom& rg, float y)
     float n = (rg.by1 - 4.f - y) / h;
     return std::max(0.f, std::min(1.f, n));
 }
+
+// ---------------------------------------------------------------- audio structure rows
+// Foldable analysis rows under an audio clip's waveform: row 0 = the EDM
+// structure map (EDMFORMER), row 1 = the song-form map (SONGFORMER). Each
+// row is a compact header whose background IS the colored section strip
+// (the structure never disappears when collapsed) and, expanded, a taller
+// band of labeled section blocks. The section under the playhead renders
+// at full saturation with a soft glow — "where we are in the track" reads
+// from across the room; everything else sits dimmed.
+static const float AA_HEAD_H = 15.f; // collapsed row height (mini strip)
+static const float AA_BODY_H = 26.f; // expanded section band
+static const float AA_WAVE_MIN = 40.f; // waveform keeps at least this
+
+static const std::vector<AudioAnalysisView::Section>& aaRowSections(const Clip& c, int row)
+{
+    return row == 0 ? c.analysis.edm : c.analysis.song;
+}
+
+static bool aaRowVisible(const Clip& c, int row)
+{
+    return !aaRowSections(c, row).empty();
+}
+
+static float aaBodyH(const Clip& c, int row)
+{
+    float anim = c.structAnim[row] < 0 ? (c.structExpanded[row] ? 1.f : 0.f)
+                                       : c.structAnim[row];
+    return anim * AA_BODY_H;
+}
+
+static float aaRowsHeight(const Clip& c)
+{
+    if (c.ctype != Clip::CType::Audio) return 0;
+    float h = 0;
+    for (int r = 0; r < 2; r++)
+        if (aaRowVisible(c, r)) h += AA_HEAD_H + aaBodyH(c, r) + 1.f;
+    return h;
+}
+
+struct AaRowGeom
+{
+    int   row = 0;
+    float hy0 = 0, hy1 = 0; // header strip (carries the mini section map)
+    float by0 = 0, by1 = 0; // expanded band (by1 == by0 when collapsed)
+};
+
+// rows stack UP from the clip's bottom edge (the waveform lives above)
+static void buildAaRows(const Clip& c, float clipY1, std::vector<AaRowGeom>& out)
+{
+    out.clear();
+    float y = clipY1 - 2 - aaRowsHeight(c);
+    for (int r = 0; r < 2; r++)
+    {
+        if (!aaRowVisible(c, r)) continue;
+        AaRowGeom g;
+        g.row = r;
+        g.hy0 = y;
+        g.hy1 = y + AA_HEAD_H;
+        g.by0 = g.hy1;
+        g.by1 = g.hy1 + aaBodyH(c, r);
+        out.push_back(g);
+        y = g.by1 + 1.f;
+    }
+}
+
+// Section palettes. Two DIFFERENT color families so the EDM row and the
+// song row never read as one: EDM = hot/energetic hues keyed to energy
+// (drop = red), song form = cooler/harmonic hues (chorus = orange is the
+// shared anchor: "the big part" matches across rows). Unknown labels get
+// a stable hue from a name hash.
+static ImVec4 aaSectionColor(const std::string& label, int row)
+{
+    struct Entry { const char* name; ImVec4 col; };
+    static const Entry kEdm[] = {
+        { "intro",     ImVec4(0.24f, 0.72f, 0.75f, 1.f) }, // teal
+        { "buildup",   ImVec4(0.95f, 0.68f, 0.18f, 1.f) }, // amber — tension
+        { "drop",      ImVec4(0.98f, 0.28f, 0.38f, 1.f) }, // hot red — impact
+        { "breakdown", ImVec4(0.33f, 0.56f, 0.98f, 1.f) }, // blue — release
+        { "outro",     ImVec4(0.62f, 0.44f, 0.92f, 1.f) }, // violet
+        { "silence",   ImVec4(0.42f, 0.44f, 0.48f, 1.f) }, // gray
+    };
+    static const Entry kSong[] = {
+        { "intro",      ImVec4(0.24f, 0.72f, 0.75f, 1.f) }, // teal (match)
+        { "verse",      ImVec4(0.38f, 0.74f, 0.44f, 1.f) }, // green
+        { "pre-chorus", ImVec4(0.76f, 0.82f, 0.30f, 1.f) }, // lime — lift
+        { "chorus",     ImVec4(0.98f, 0.55f, 0.24f, 1.f) }, // orange — the hook
+        { "bridge",     ImVec4(0.69f, 0.42f, 0.93f, 1.f) }, // purple
+        { "inst",       ImVec4(0.30f, 0.70f, 0.85f, 1.f) }, // cyan
+        { "outro",      ImVec4(0.62f, 0.44f, 0.92f, 1.f) }, // violet (match)
+        { "silence",    ImVec4(0.42f, 0.44f, 0.48f, 1.f) }, // gray
+    };
+    if (row == 0)
+    {
+        for (const Entry& e : kEdm)
+            if (label == e.name) return e.col;
+    }
+    else
+    {
+        for (const Entry& e : kSong)
+            if (label == e.name) return e.col;
+    }
+    // stable fallback hue from the label
+    unsigned h = 2166136261u;
+    for (char ch : label) { h ^= (unsigned char)ch; h *= 16777619u; }
+    float hue = (h % 360u) / 360.f;
+    float r, g, b;
+    ImGui::ColorConvertHSVtoRGB(hue, 0.55f, 0.8f, r, g, b);
+    return ImVec4(r, g, b, 1.f);
+}
+
+static const char* aaRowTitle(int row) { return row == 0 ? "EDM" : "SONG"; }
 
 static float normToY(const LaneGeom& g, float norm)
 {
@@ -312,6 +435,49 @@ double TimelineUI::snapStep(const Sequence& seq, double pps) const
 double TimelineUI::snapTime(const Sequence& seq, double t, bool bypass) const
 {
     if (!snapEnabled || bypass) return std::max(0.0, t);
+    // Beats mode over an analyzed audio clip: snap to the TRACKED beats
+    // (with the chosen subdivision interpolated between neighbours) — a
+    // clip dropped "on the beat" is on the REAL beat, not a constant-BPM
+    // approximation of it.
+    if (gridMode == 1)
+    {
+        if (Clip* ac = seq.analysisAudioClip(); ac && ac->analysis.beats.size() >= 2)
+        {
+            const auto& bs = ac->analysis.beats;
+            const double base = ac->start() - ac->offsetP->floatValue();
+            const double mt = t - base;
+            static const int subs[] = { 1, 2, 4 };
+            const int sub = subs[std::max(0, std::min(2, beatDivision))];
+            // neighbours around mt (extrapolate with the edge gap outside)
+            size_t hi = 0;
+            while (hi < bs.size() && bs[hi].time < mt) hi++;
+            double b0, b1;
+            if (hi == 0)
+            {
+                double gap = bs[1].time - bs[0].time;
+                double k = std::floor((mt - bs[0].time) / gap);
+                b0 = bs[0].time + k * gap; b1 = b0 + gap;
+            }
+            else if (hi >= bs.size())
+            {
+                double gap = bs[bs.size() - 1].time - bs[bs.size() - 2].time;
+                double k = std::floor((mt - bs[bs.size() - 1].time) / gap);
+                b0 = bs[bs.size() - 1].time + k * gap; b1 = b0 + gap;
+            }
+            else
+            {
+                b0 = bs[hi - 1].time; b1 = bs[hi].time;
+            }
+            double best = b0, bestD = 1e18;
+            for (int k = 0; k <= sub; k++)
+            {
+                double cand = b0 + (b1 - b0) * k / sub;
+                double d = std::fabs(cand - mt);
+                if (d < bestD) { bestD = d; best = cand; }
+            }
+            return std::max(0.0, base + best);
+        }
+    }
     double s = snapStep(seq, seq.pixelsPerSecond);
     return std::max(0.0, std::round(t / s) * s);
 }
@@ -421,7 +587,31 @@ void TimelineUI::toolbar(Sequence& seq)
     ImGui::SetNextItemWidth(66);
     const char* gridNames[] = { "Time", "Beats" };
     ImGui::Combo("##gridmode", &gridMode, gridNames, 2);
-    ImGui::SetItemTooltip("Ruler & grid mode (Beats uses the sequence BPM)");
+    ImGui::SetItemTooltip("Ruler & grid mode (Beats follows the TRACKED beats when the "
+                          "audio is analyzed, the sequence BPM otherwise)");
+    // tracked-tempo chip: the analyzed audio clip's BPM + meter — and the
+    // promise that the Beats grid sits on real downbeats
+    if (Clip* ac = seq.analysisAudioClip(); ac && ac->analysis.bpm > 0)
+    {
+        ImGui::SameLine(0, 10);
+        char bpmChip[48];
+        if (ac->analysis.beatsPerBar > 0)
+            snprintf(bpmChip, sizeof(bpmChip), "%.1f BPM · %d/4",
+                     ac->analysis.bpm, ac->analysis.beatsPerBar);
+        else
+            snprintf(bpmChip, sizeof(bpmChip), "%.1f BPM", ac->analysis.bpm);
+        ImGui::TextColored(ImVec4(0.55f, 0.78f, 0.94f, 1.f), "%s", bpmChip);
+        if (ImGui::IsItemHovered())
+        {
+            int downs = 0;
+            for (const auto& b : ac->analysis.beats)
+                if (b.downbeat) downs++;
+            ImGui::SetTooltip("Tracked by the audio analysis: %d beats, %d bars.\n"
+                              "The Beats grid and snapping follow these tracked "
+                              "positions (tempo drift included).",
+                              (int)ac->analysis.beats.size(), downs);
+        }
+    }
     ImGui::SameLine();
     ImGui::Checkbox("Magnet", &magnetEnabled);
     ImGui::SetItemTooltip("Snap to clip edges, keys, cues, loop points and the playhead");
@@ -570,10 +760,20 @@ void TimelineUI::body(Sequence& seq)
                 IM_COL32(170, 170, 175, 255), seq.niceName.c_str());
     dl->PopClipRect();
 
-    // grid steps (time or beats)
+    // grid steps (time or beats). With an analyzed audio clip in the
+    // sequence, Beats mode upgrades from the constant-BPM ruler to the
+    // TRACKED beat list — bars sit on real downbeats, tempo drift and all.
+    Clip* aaGridClip = seq.analysisAudioClip();
+    const bool trackedGrid = gridMode == 1 && aaGridClip &&
+                             aaGridClip->analysis.beats.size() >= 2;
+    const double aaGridBase = aaGridClip
+                                  ? aaGridClip->start() - aaGridClip->offsetP->floatValue()
+                                  : 0.0;
     double majorStep, minorStep;
     int beatsPerBar = seq.beatsPerBarP->intValue();
     double beatDur = 60.0 / std::max(20.f, seq.bpmP->floatValue());
+    if (trackedGrid && aaGridClip->analysis.bpm > 1)
+        beatDur = 60.0 / aaGridClip->analysis.bpm; // zoom heuristics below
     if (gridMode == 1)
     {
         minorStep = beatDur;
@@ -590,6 +790,38 @@ void TimelineUI::body(Sequence& seq)
     }
 
     dl->PushClipRect(ImVec2(laneX0, rulerMin.y), rulerMax, true);
+    if (trackedGrid)
+    {
+        // tracked ruler: minor ticks on beats, strong ticks + bar numbers
+        // on downbeats (bar n = n-th downbeat)
+        const auto& bs = aaGridClip->analysis.beats;
+        const float beatPx = (float)(beatDur * pps);
+        const bool showBeats = beatPx >= 6.f;
+        float lastLabelX = -1e9f;
+        int bar = 0;
+        for (const auto& b : bs)
+        {
+            if (b.downbeat) bar++;
+            float x = timeToX(aaGridBase + b.time);
+            if (x < laneX0 - 8) continue;
+            if (x > rulerMax.x + 8) break;
+            if (!b.downbeat && !showBeats) continue;
+            float h = b.downbeat ? 11.f : 5.f;
+            dl->AddLine(ImVec2(x, rulerMax.y - h), ImVec2(x, rulerMax.y),
+                        IM_COL32(140, 140, 145, b.downbeat ? 210 : 100), 1.f);
+            if (b.downbeat && x - lastLabelX > 34.f)
+            {
+                std::string lbl = "b" + std::to_string(bar);
+                dl->AddText(ImVec2(x + 3, rulerMax.y - 12 - ImGui::GetFontSize()),
+                            IM_COL32(150, 150, 155, 220), lbl.c_str());
+                lastLabelX = x;
+            }
+        }
+        double t0v = std::max(0.0, viewStart);
+        double tEnd = xToTime(origin.x + avail.x);
+        (void)t0v; (void)tEnd;
+    }
+    else
     {
         double t0v = std::max(0.0, viewStart);
         double tEnd = xToTime(origin.x + avail.x);
@@ -614,6 +846,8 @@ void TimelineUI::body(Sequence& seq)
                             IM_COL32(150, 150, 155, 220), lbl.c_str());
             }
         }
+    }
+    {
         float xe = timeToX(seq.totalTime());
         if (xe < rulerMax.x)
             dl->AddRectFilled(ImVec2(std::max(xe, laneX0), rulerMin.y), rulerMax, IM_COL32(0, 0, 0, 90));
@@ -828,6 +1062,7 @@ void TimelineUI::body(Sequence& seq)
     for (auto& l : seq.layers)
         if (auto* cl0 = dynamic_cast<ClipLayer*>(l.get()))
             for (auto& c : cl0->clips)
+            {
                 for (auto& a : c->automations)
                 {
                     float target = a->expanded ? 1.f : 0.f;
@@ -839,6 +1074,19 @@ void TimelineUI::body(Sequence& seq)
                         if (std::fabs(a->uiAnim - target) < 0.01f) a->uiAnim = target;
                     }
                 }
+                // audio structure rows ease the same way
+                for (int r = 0; r < 2; r++)
+                {
+                    float target = c->structExpanded[r] ? 1.f : 0.f;
+                    float& an = c->structAnim[r];
+                    if (an < 0) an = target;
+                    else
+                    {
+                        an += (target - an) * std::min(1.f, io.DeltaTime * 14.f);
+                        if (std::fabs(an - target) < 0.01f) an = target;
+                    }
+                }
+            }
 
     // effective lane height: clip tracks auto-grow so the tallest block
     // (title + expanded automation rows) always fits; the header grip still
@@ -1021,6 +1269,40 @@ void TimelineUI::body(Sequence& seq)
                             else if (mouse.x > x1 - edge)  hit.kind = Hit::ClipR;
                             else                           hit.kind = Hit::ClipBody;
                             hit.clip = c;
+
+                            // audio structure rows (Audio clips): header
+                            // toggles the fold, a section block is a
+                            // navigation target (click = jump, right-click
+                            // = loop/cue menu)
+                            if (hit.kind == Hit::ClipBody && c->ctype == Clip::CType::Audio &&
+                                aaRowsHeight(*c) > 0)
+                            {
+                                std::vector<AaRowGeom> rows;
+                                buildAaRows(*c, cy1, rows);
+                                for (auto& rg : rows)
+                                {
+                                    if (mouse.y >= rg.hy0 && mouse.y < rg.hy1)
+                                    {
+                                        hit.kind = Hit::AAHeader;
+                                        hit.aaRow = rg.row;
+                                        break;
+                                    }
+                                    if (mouse.y >= rg.by0 && mouse.y < rg.by1 && rg.by1 > rg.by0 + 4)
+                                    {
+                                        const auto& secs = aaRowSections(*c, rg.row);
+                                        double off = c->offsetP->floatValue();
+                                        double mt = off + (mouse.x - x0) / pps; // media time
+                                        int si = AudioAnalysisView::sectionAt(secs, mt);
+                                        if (si >= 0)
+                                        {
+                                            hit.kind = Hit::AASection;
+                                            hit.aaRow = rg.row;
+                                            hit.aaSection = si;
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
 
                             // embedded automation rows (Block clips)
                             if (hit.kind == Hit::ClipBody && !c->automations.empty() &&
@@ -1754,6 +2036,27 @@ void TimelineUI::body(Sequence& seq)
             // expand / collapse the automation row (smooth: uiAnim eases,
             // block + track heights follow)
             hit.cauto->expanded = !hit.cauto->expanded;
+            hit.clip->select();
+            break;
+        }
+        case Hit::AAHeader:
+        {
+            // expand / collapse the audio structure row (same smooth fold)
+            hit.clip->structExpanded[hit.aaRow] = !hit.clip->structExpanded[hit.aaRow];
+            hit.clip->select();
+            break;
+        }
+        case Hit::AASection:
+        {
+            // musical navigation: a section block IS a jump target — click
+            // seeks to its start (timeline time via the clip's start/offset)
+            const auto& secs = aaRowSections(*hit.clip, hit.aaRow);
+            if (hit.aaSection >= 0 && hit.aaSection < (int)secs.size())
+            {
+                double tl = hit.clip->start() - hit.clip->offsetP->floatValue() +
+                            secs[(size_t)hit.aaSection].t0;
+                seq.setTime(std::max(0.0, tl));
+            }
             hit.clip->select();
             break;
         }
@@ -2869,6 +3172,12 @@ void TimelineUI::body(Sequence& seq)
             ctxItemId = hit.clip->id;
             ImGui::OpenPopup("carow_ctx");
             break;
+        case Hit::AASection:
+            ctxClipId = hit.clip->id;
+            ctxAaRow = hit.aaRow;
+            ctxAaSection = hit.aaSection;
+            ImGui::OpenPopup("aasection_ctx");
+            break;
         case Hit::AKey:
             ctxItemId = hit.keyId;
             ImGui::OpenPopup("akey_ctx");
@@ -2967,6 +3276,24 @@ void TimelineUI::body(Sequence& seq)
     if (!geoms.empty())
     {
         cdl->PushClipRect(ImVec2(cLaneX0, canvasP0.y), ImVec2(cLaneX1, lanesBottom), true);
+        if (trackedGrid)
+        {
+            // tracked beat grid: downbeats carry the bar line, beats a hint
+            const auto& bs = aaGridClip->analysis.beats;
+            const float beatPx = (float)(beatDur * pps);
+            const bool showBeats = beatPx >= 4.f;
+            for (const auto& b : bs)
+            {
+                float x = timeToX(aaGridBase + b.time);
+                if (x < cLaneX0 - 2) continue;
+                if (x > cLaneX1 + 2) break;
+                if (!b.downbeat && !showBeats) continue;
+                cdl->AddLine(ImVec2(x, canvasP0.y), ImVec2(x, lanesBottom),
+                             IM_COL32(255, 255, 255, b.downbeat ? 16 : 6), 1.f);
+            }
+        }
+        else
+        {
         double tEnd = xToTime(cLaneX1);
         double tm = std::floor(std::max(0.0, viewStart) / minorStep) * minorStep;
         for (; tm <= tEnd; tm += minorStep)
@@ -2975,6 +3302,7 @@ void TimelineUI::body(Sequence& seq)
             bool isMajor = std::fabs(std::fmod(tm + minorStep * 0.5, majorStep) - minorStep * 0.5) < minorStep * 0.25;
             cdl->AddLine(ImVec2(x, canvasP0.y), ImVec2(x, lanesBottom),
                          IM_COL32(255, 255, 255, isMajor ? 14 : 6), 1.f);
+        }
         }
         float xe = timeToX(seq.totalTime());
         if (xe < cLaneX1)
@@ -3056,11 +3384,13 @@ void TimelineUI::body(Sequence& seq)
                                  col32(accent, 0.28f + 0.18f * (float)std::sin(nowT * 6.0)),
                                  5.f, 0, 2.f);
 
-                // waveform (with fade envelope + media loop tiling)
+                // waveform (with fade envelope + media loop tiling); the
+                // structure-analysis rows own the bottom band when present
                 if (c->ctype == Clip::CType::Audio && c->asset)
                 {
+                    const float aaRows = aaRowsHeight(*c);
                     float wy0 = y0 + ImGui::GetFontSize() + 6;
-                    float wy1 = y1 - 2;
+                    float wy1 = y1 - 2 - aaRows;
                     if (wy1 > wy0 + 4)
                     {
                         float mid = (wy0 + wy1) * 0.5f;
@@ -3072,6 +3402,12 @@ void TimelineUI::body(Sequence& seq)
                         float px0 = std::max(x0, cLaneX0);
                         float px1 = std::min(x1, cLaneX1);
                         ImU32 wcol = IM_COL32(255, 255, 255, cEnabled ? 110 : 45);
+                        // the waveform itself wears the EDM section color at
+                        // a whisper — the whole track reads as a structure
+                        // map even with both rows collapsed
+                        const auto& tintSecs = !c->analysis.edm.empty() ? c->analysis.edm
+                                                                        : c->analysis.song;
+                        int tintIdx = -1; // advancing cursor (px time is monotonic)
                         for (float px = px0; px < px1; px += 1.f)
                         {
                             double local = (px - x0) / pps;
@@ -3084,7 +3420,26 @@ void TimelineUI::body(Sequence& seq)
                                 float env = gain * c->fadeGainAt(local);
                                 mn = std::max(-1.f, std::min(1.f, mn * env));
                                 mx = std::max(-1.f, std::min(1.f, mx * env));
-                                cdl->AddLine(ImVec2(px, mid - mx * half), ImVec2(px, mid - mn * half + 1), wcol, 1.f);
+                                ImU32 col = wcol;
+                                if (!tintSecs.empty() && cEnabled)
+                                {
+                                    while (tintIdx + 1 < (int)tintSecs.size() &&
+                                           lt0 >= tintSecs[(size_t)(tintIdx + 1)].t0)
+                                        tintIdx++;
+                                    if (loopMedia && tintIdx >= 0 &&
+                                        lt0 < tintSecs[(size_t)tintIdx].t0)
+                                        tintIdx = AudioAnalysisView::sectionAt(tintSecs, lt0);
+                                    if (tintIdx >= 0 && lt0 < tintSecs[(size_t)tintIdx].t1)
+                                    {
+                                        ImVec4 sc = aaSectionColor(
+                                            tintSecs[(size_t)tintIdx].label,
+                                            &tintSecs == &c->analysis.edm ? 0 : 1);
+                                        col = IM_COL32((int)(255 * (0.55f + 0.45f * sc.x)),
+                                                       (int)(255 * (0.55f + 0.45f * sc.y)),
+                                                       (int)(255 * (0.55f + 0.45f * sc.z)), 120);
+                                    }
+                                }
+                                cdl->AddLine(ImVec2(px, mid - mx * half), ImVec2(px, mid - mn * half + 1), col, 1.f);
                             }
                         }
                         // loop tiling separators
@@ -3130,6 +3485,179 @@ void TimelineUI::body(Sequence& seq)
                 cdl->AddText(ImVec2(x0 + 6, y0 + 3), IM_COL32(10, 10, 12, 220), c->niceName.c_str());
                 cdl->AddText(ImVec2(x0 + 5, y0 + 2), IM_COL32(255, 255, 255, cEnabled ? 235 : 130), c->niceName.c_str());
                 cdl->PopClipRect();
+
+                // analysis progress / error chip (top-right of the audio
+                // clip): "analyzing beats…", "structure (EDM) 63%", errors
+                if (c->ctype == Clip::CType::Audio && !c->analysis.status.empty())
+                {
+                    const float sSz = ImGui::GetFontSize() * 0.8f;
+                    float sw = ImGui::GetFont()->CalcTextSizeA(
+                                   sSz, FLT_MAX, 0.f, c->analysis.status.c_str()).x;
+                    float sx1 = std::min(x1, cLaneX1) - 6, sx0 = sx1 - sw - 8;
+                    if (sx0 > x0 + 40)
+                    {
+                        bool isErr = c->analysis.status.rfind("error", 0) == 0;
+                        cdl->AddRectFilled(ImVec2(sx0, y0 + 2), ImVec2(sx1, y0 + 4 + sSz),
+                                           IM_COL32(10, 10, 12, 190), 2.f);
+                        cdl->AddText(ImGui::GetFont(), sSz, ImVec2(sx0 + 4, y0 + 3),
+                                     isErr ? IM_COL32(240, 110, 110, 235)
+                                           : IM_COL32(150, 200, 255, 225),
+                                     c->analysis.status.c_str());
+                    }
+                }
+
+                // ---- audio structure rows (EDMFORMER + SONGFORMER maps) ----
+                // Each row: a header whose BACKGROUND is the time-aligned
+                // mini section strip (folding never hides the structure) and
+                // an expandable band of labeled blocks. The section under
+                // the playhead burns at full saturation with a soft glow —
+                // where-we-are reads at a glance; the rest sits dimmed.
+                if (c->ctype == Clip::CType::Audio && aaRowsHeight(*c) > 0)
+                {
+                    std::vector<AaRowGeom> aaRows;
+                    buildAaRows(*c, y1, aaRows);
+                    const double base = c->start() - c->offsetP->floatValue();
+                    const double mediaNow = seq.currentTime - base;
+                    const float rowFontSz = ImGui::GetFontSize() * 0.78f;
+                    cdl->PushClipRect(ImVec2(x0 + 1, y0), ImVec2(x1 - 1, y1), true);
+                    for (auto& rg : aaRows)
+                    {
+                        const auto& secs = aaRowSections(*c, rg.row);
+                        const float open = c->structAnim[rg.row] < 0
+                                               ? (c->structExpanded[rg.row] ? 1.f : 0.f)
+                                               : c->structAnim[rg.row];
+                        const int nowIdx = AudioAnalysisView::sectionAt(secs, mediaNow);
+
+                        // header backdrop + time-aligned mini strip
+                        cdl->AddRectFilled(ImVec2(x0 + 2, rg.hy0), ImVec2(x1 - 2, rg.hy1 - 1),
+                                           IM_COL32(14, 14, 17, 230), 3.f);
+                        for (size_t i = 0; i < secs.size(); i++)
+                        {
+                            float sx0 = std::max((float)timeToX(base + secs[i].t0), x0 + 2);
+                            float sx1 = std::min((float)timeToX(base + secs[i].t1) - 1.f, x1 - 2);
+                            if (sx1 <= sx0) continue;
+                            const bool isNow = (int)i == nowIdx;
+                            ImVec4 col = aaSectionColor(secs[i].label, rg.row);
+                            cdl->AddRectFilled(ImVec2(sx0, rg.hy0 + 1), ImVec2(sx1, rg.hy1 - 2),
+                                               col32(col, cEnabled ? (isNow ? 0.95f : 0.38f)
+                                                                   : 0.2f), 2.f);
+                            if (isNow && cEnabled && seq.playing)
+                                cdl->AddRectFilled(ImVec2(sx0, rg.hy0 + 1), ImVec2(sx1, rg.hy1 - 2),
+                                                   col32(lighten(col, 0.3f),
+                                                         0.12f + 0.10f * (float)std::sin(nowT * 5.0)),
+                                                   2.f);
+                        }
+                        // fold triangle + row tag over a dark underlay
+                        {
+                            float tagW = ImGui::GetFont()->CalcTextSizeA(
+                                             rowFontSz, FLT_MAX, 0.f, aaRowTitle(rg.row)).x;
+                            cdl->AddRectFilled(ImVec2(x0 + 2, rg.hy0 + 1),
+                                               ImVec2(x0 + 24 + tagW, rg.hy1 - 2),
+                                               IM_COL32(10, 10, 12, 175), 2.f);
+                            ImVec2 tc(x0 + 11.f, (rg.hy0 + rg.hy1) * 0.5f - 0.5f);
+                            float r = 3.2f, ang = open * 1.5707963f;
+                            auto rot = [&](float px2, float py2)
+                            {
+                                float ca = std::cos(ang), sa = std::sin(ang);
+                                return ImVec2(tc.x + px2 * ca - py2 * sa, tc.y + px2 * sa + py2 * ca);
+                            };
+                            cdl->AddTriangleFilled(rot(-r * 0.6f, -r), rot(-r * 0.6f, r), rot(r, 0),
+                                                   IM_COL32(235, 235, 240, cEnabled ? 215 : 120));
+                            cdl->AddText(ImGui::GetFont(), rowFontSz,
+                                         ImVec2(x0 + 19, rg.hy0 + 1.5f),
+                                         IM_COL32(200, 202, 210, cEnabled ? 220 : 120),
+                                         aaRowTitle(rg.row));
+                        }
+                        // now-chip: current section + time to the next
+                        // boundary ("drop · 12s") — the operator's countdown
+                        if (cEnabled && mediaNow >= 0)
+                        {
+                            char chip[64] = {};
+                            ImVec4 chipCol(0.62f, 0.63f, 0.68f, 1.f);
+                            if (nowIdx >= 0)
+                            {
+                                double left = secs[(size_t)nowIdx].t1 - mediaNow;
+                                snprintf(chip, sizeof(chip), "%s · %.0fs",
+                                         secs[(size_t)nowIdx].label.c_str(),
+                                         std::max(0.0, left));
+                                chipCol = aaSectionColor(secs[(size_t)nowIdx].label, rg.row);
+                            }
+                            else
+                            {
+                                // before/between sections: what comes next?
+                                for (const auto& s : secs)
+                                    if (s.t0 > mediaNow)
+                                    {
+                                        snprintf(chip, sizeof(chip), "%s in %.0fs",
+                                                 s.label.c_str(), s.t0 - mediaNow);
+                                        chipCol = aaSectionColor(s.label, rg.row);
+                                        break;
+                                    }
+                            }
+                            if (chip[0])
+                            {
+                                float cw = ImGui::GetFont()->CalcTextSizeA(
+                                               rowFontSz, FLT_MAX, 0.f, chip).x;
+                                float cx1 = x1 - 6, cx0 = cx1 - cw - 8;
+                                cdl->AddRectFilled(ImVec2(cx0, rg.hy0 + 1), ImVec2(cx1, rg.hy1 - 2),
+                                                   IM_COL32(10, 10, 12, 195), 2.f);
+                                cdl->AddText(ImGui::GetFont(), rowFontSz,
+                                             ImVec2(cx0 + 4, rg.hy0 + 1.5f),
+                                             col32(lighten(chipCol, 0.25f), 0.95f), chip);
+                            }
+                        }
+
+                        // expanded band: labeled blocks
+                        if (rg.by1 > rg.by0 + 4)
+                        {
+                            for (size_t i = 0; i < secs.size(); i++)
+                            {
+                                float sx0 = std::max((float)timeToX(base + secs[i].t0), x0 + 2);
+                                float sx1 = std::min((float)timeToX(base + secs[i].t1) - 1.f, x1 - 2);
+                                if (sx1 <= sx0) continue;
+                                const bool isNow = (int)i == nowIdx;
+                                ImVec4 col = aaSectionColor(secs[i].label, rg.row);
+                                float alpha = cEnabled ? (isNow ? 0.92f : 0.42f) : 0.2f;
+                                cdl->AddRectFilled(ImVec2(sx0, rg.by0 + 1), ImVec2(sx1, rg.by1 - 1),
+                                                   col32(col, alpha), 3.f);
+                                if (isNow && cEnabled)
+                                {
+                                    float glow = seq.playing
+                                                     ? 0.35f + 0.2f * (float)std::sin(nowT * 5.0)
+                                                     : 0.35f;
+                                    cdl->AddRect(ImVec2(sx0 - 0.5f, rg.by0 + 0.5f),
+                                                 ImVec2(sx1 + 0.5f, rg.by1 - 0.5f),
+                                                 col32(lighten(col, 0.45f), glow), 3.f, 0, 1.6f);
+                                }
+                                // centered label when it fits
+                                float lw = ImGui::GetFont()->CalcTextSizeA(
+                                               rowFontSz, FLT_MAX, 0.f, secs[i].label.c_str()).x;
+                                if (lw + 8 < sx1 - sx0)
+                                {
+                                    ImVec2 lp((sx0 + sx1 - lw) * 0.5f,
+                                              (rg.by0 + rg.by1 - rowFontSz) * 0.5f);
+                                    cdl->AddText(ImGui::GetFont(), rowFontSz,
+                                                 ImVec2(lp.x + 1, lp.y + 1),
+                                                 IM_COL32(0, 0, 0, isNow ? 190 : 120),
+                                                 secs[i].label.c_str());
+                                    cdl->AddText(ImGui::GetFont(), rowFontSz, lp,
+                                                 IM_COL32(255, 255, 255,
+                                                          cEnabled ? (isNow ? 255 : 175) : 110),
+                                                 secs[i].label.c_str());
+                                }
+                            }
+                            // playhead dot riding the expanded band
+                            if (mediaNow >= 0 && nowIdx >= 0)
+                            {
+                                float pxh = timeToX(seq.currentTime);
+                                if (pxh >= x0 && pxh <= x1)
+                                    cdl->AddCircleFilled(ImVec2(pxh, rg.by1 - 4.f), 2.4f,
+                                                         IM_COL32(255, 255, 255, 230));
+                            }
+                        }
+                    }
+                    cdl->PopClipRect();
+                }
 
                 // ---- embedded automation rows (the block CONTAINS its
                 // automations: compact named headers, expandable editors) ----
@@ -3994,6 +4522,37 @@ void TimelineUI::body(Sequence& seq)
                             { sp });
                     }
                 }
+            }
+        }
+        ImGui::EndPopup();
+    }
+
+    // audio structure section: navigation shortcuts on the analyzed map —
+    // the section IS the musical unit a programmer works against
+    if (ImGui::BeginPopup("aasection_ctx"))
+    {
+        Clip* c = seq.findClip(ctxClipId);
+        const auto* secs = c && ctxAaRow >= 0 ? &aaRowSections(*c, ctxAaRow) : nullptr;
+        if (c && secs && ctxAaSection >= 0 && ctxAaSection < (int)secs->size())
+        {
+            const AudioAnalysisView::Section& s = (*secs)[(size_t)ctxAaSection];
+            double base = c->start() - c->offsetP->floatValue();
+            double tl0 = std::max(0.0, base + s.t0);
+            double tl1 = std::max(tl0, base + s.t1);
+            ImGui::TextDisabled("%s  %s — %s", s.label.c_str(),
+                                formatTime(tl0).c_str(), formatTime(tl1).c_str());
+            ImGui::Separator();
+            if (ImGui::MenuItem("Jump To Section Start")) seq.setTime(tl0);
+            if (ImGui::MenuItem("Loop This Section"))
+            {
+                seq.loopIn = tl0;
+                seq.loopOut = tl1;
+            }
+            if (ImGui::MenuItem("Add Cue At Section Start"))
+            {
+                json pre = seq.cuesToJson();
+                seq.addCue(tl0, s.label);
+                pushCuesEdit(sp, pre, "Add Cue");
             }
         }
         ImGui::EndPopup();

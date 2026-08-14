@@ -130,6 +130,34 @@ public:
     uint64_t newId() const; // sequence-scoped id mint (via the owning clip)
 };
 
+// ---------------------------------------------------------------- AudioAnalysisView
+// Machine-listened facts about an audio clip's media, drawn as foldable
+// structure rows under the waveform and as the tracked beat grid: beats +
+// downbeats (beat tracker) and two labeled section maps (an EDM-structure
+// model and a general song-form model). HOST-FED: the embedding app owns
+// the data (and its persistence) and refreshes this view whenever its
+// store changes — organic never serializes the data itself, only the two
+// fold flags on the clip. All times are MEDIA-LOCAL seconds (0 = start of
+// the audio file); the UI maps them through the clip's start/offset.
+struct AudioAnalysisView
+{
+    struct Section { double t0 = 0, t1 = 0; std::string label; };
+    struct Beat    { double time = 0; bool downbeat = false; };
+
+    double bpm = 0;                 // 0 = unknown
+    int    beatsPerBar = 0;         // dominant meter (0 = unknown)
+    std::vector<Beat>    beats;     // sorted by time
+    std::vector<Section> edm;       // EDM head: intro/buildup/drop/breakdown/…
+    std::vector<Section> song;      // song head: verse/chorus/bridge/inst/…
+    std::string status;             // "" or a progress/error line to display
+    int revision = 0;               // host bumps on change (cache invalidation)
+
+    bool hasData() const { return !beats.empty() || !edm.empty() || !song.empty(); }
+    bool hasRows() const { return !edm.empty() || !song.empty() || !status.empty(); }
+    // index of the section containing t (media seconds), -1 when none
+    static int sectionAt(const std::vector<Section>& v, double t);
+};
+
 // ---------------------------------------------------------------- Clip
 class Clip : public Container
 {
@@ -155,6 +183,13 @@ public:
     Parameter* loopMediaP = nullptr; // tile the media to fill the clip
 
     std::shared_ptr<AudioAsset> asset; // waveform data (audio clips)
+
+    // audio structure analysis (audio clips): host-fed data + two foldable
+    // rows under the waveform — row 0 = the EDM structure map, row 1 = the
+    // song-form map. Fold flags persist with the clip; anim is runtime.
+    AudioAnalysisView analysis;
+    bool  structExpanded[2] = { false, false };
+    float structAnim[2] = { -1.f, -1.f };
 
     // embedded automations (Block clips): the block contains its automation
     // rows — as many internal rows as the effect has automated parameters
@@ -394,6 +429,11 @@ public:
     void   moveLayer(int from, int to);
 
     Clip* findClip(uint64_t id, ClipLayer** outLayer = nullptr) const;
+
+    // the audio clip whose host-fed analysis drives the tracked beat grid
+    // and the toolbar BPM chip: the first audio clip carrying data (layer
+    // order — the pinned audio lane wins in practice). null when none.
+    Clip* analysisAudioClip() const;
 
     // cues
     TimeCue* addCue(double t, const std::string& name = "Cue");

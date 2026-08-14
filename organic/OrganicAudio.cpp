@@ -1,5 +1,6 @@
 #include "OrganicAudio.h"
 #include "OrganicCore.h"
+#include "miniaudio.h" // declarations only — the impl lives in OrganicAudioEngine.cpp
 #include <cstdio>
 #include <cstring>
 #include <cmath>
@@ -261,6 +262,45 @@ AudioBuffer makeSweep(float seconds, float f0, float f1)
 // ---------------------------------------------------------------- cache
 AudioCache& AudioCache::get() { static AudioCache c; return c; }
 
+// ma_decoder: WAV/FLAC/MP3 natively (dr_libs embedded in miniaudio),
+// decoded to f32 with the SOURCE rate/channels kept — playback and peaks
+// are rate-agnostic, so nothing downstream cares what the file was.
+bool decodeAudio(const std::string& path, AudioBuffer& out, std::string* err)
+{
+    ma_decoder_config cfg = ma_decoder_config_init(ma_format_f32, 0, 0); // 0 = keep source
+    ma_decoder dec;
+    ma_result r = ma_decoder_init_file(path.c_str(), &cfg, &dec);
+    if (r != MA_SUCCESS)
+    {
+        if (err) *err = std::string("ma_decoder: ") + ma_result_description(r);
+        return false;
+    }
+    out.channels   = (int)dec.outputChannels;
+    out.sampleRate = (int)dec.outputSampleRate;
+    out.samples.clear();
+    ma_uint64 totalFrames = 0;
+    if (ma_decoder_get_length_in_pcm_frames(&dec, &totalFrames) == MA_SUCCESS &&
+        totalFrames > 0)
+        out.samples.reserve((size_t)totalFrames * (size_t)out.channels);
+    std::vector<float> chunk((size_t)4096 * (size_t)std::max(1, out.channels));
+    for (;;)
+    {
+        ma_uint64 got = 0;
+        r = ma_decoder_read_pcm_frames(&dec, chunk.data(), 4096, &got);
+        if (got > 0)
+            out.samples.insert(out.samples.end(), chunk.begin(),
+                               chunk.begin() + (size_t)got * (size_t)out.channels);
+        if (r != MA_SUCCESS || got < 4096) break; // MA_AT_END included
+    }
+    ma_decoder_uninit(&dec);
+    if (out.samples.empty())
+    {
+        if (err) *err = "ma_decoder: no frames decoded";
+        return false;
+    }
+    return true;
+}
+
 std::shared_ptr<AudioAsset> AudioCache::load(const std::string& path)
 {
     auto it = cache.find(path);
@@ -269,16 +309,34 @@ std::shared_ptr<AudioAsset> AudioCache::load(const std::string& path)
 
     auto asset = std::make_shared<AudioAsset>();
     asset->path = path;
-    std::string err;
-    if (!loadWav(path, asset->buffer, &err))
+    // decode ladder: ma_decoder (wav/flac/mp3) → classic WAV reader (odd
+    // RIFFs ma rejects) → host fallback hook (AIFF/ALAC/AAC/… — e.g. the
+    // ffmpeg CLI in Light Show Studio)
+    std::string err1, err2, err3;
+    const char* via = "ma_decoder";
+    bool ok = decodeAudio(path, asset->buffer, &err1);
+    if (!ok)
     {
-        OLOGE("Audio", "Failed to load '" << path << "': " << err);
+        ok = loadWav(path, asset->buffer, &err2);
+        via = "wav";
+    }
+    if (!ok && decodeFallback)
+    {
+        ok = decodeFallback(path, asset->buffer, &err3);
+        via = "host fallback";
+    }
+    if (!ok)
+    {
+        OLOGE("Audio", "Failed to load '" << path << "': " << err1
+              << (err2.empty() ? "" : " | ") << err2
+              << (err3.empty() ? "" : " | ") << err3);
         return nullptr;
     }
     asset->peaks.build(asset->buffer);
     cache[path] = asset;
     OLOG("Audio", "Loaded '" << path << "' (" << asset->buffer.duration() << "s, "
-         << asset->buffer.channels << " ch, " << asset->buffer.sampleRate << " Hz)");
+         << asset->buffer.channels << " ch, " << asset->buffer.sampleRate << " Hz, "
+         << via << ")");
     return asset;
 }
 

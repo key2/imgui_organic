@@ -596,6 +596,10 @@ json Clip::save() const
         for (auto& a : automations) arr.push_back(a->save());
         j["autos"] = arr;
     }
+    // audio structure rows: only the FOLD state persists (the analysis
+    // data itself is host-owned and re-fed on load)
+    if (structExpanded[0] || structExpanded[1])
+        j["structExp"] = json::array({ structExpanded[0], structExpanded[1] });
     return j;
 }
 
@@ -603,6 +607,11 @@ void Clip::load(const json& j)
 {
     Container::load(j);
     if (j.contains("id")) id = j["id"].get<uint64_t>();
+    if (j.contains("structExp") && j["structExp"].is_array() && j["structExp"].size() >= 2)
+    {
+        structExpanded[0] = j["structExp"][0].get<bool>();
+        structExpanded[1] = j["structExp"][1].get<bool>();
+    }
     automations.clear();
     if (j.contains("autos"))
     {
@@ -1417,6 +1426,23 @@ Clip* Sequence::findClip(uint64_t cid, ClipLayer** outLayer) const
             }
         }
     }
+    return nullptr;
+}
+
+int AudioAnalysisView::sectionAt(const std::vector<Section>& v, double t)
+{
+    for (int i = (int)v.size() - 1; i >= 0; i--)
+        if (t >= v[(size_t)i].t0 && t < v[(size_t)i].t1) return i;
+    return -1;
+}
+
+Clip* Sequence::analysisAudioClip() const
+{
+    for (auto& l : layers)
+        if (auto* cl = dynamic_cast<ClipLayer*>(l.get()))
+            for (auto& c : cl->clips)
+                if (c->ctype == Clip::CType::Audio && c->analysis.hasData())
+                    return c.get();
     return nullptr;
 }
 

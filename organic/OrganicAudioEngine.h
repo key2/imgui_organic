@@ -40,6 +40,11 @@ public:
 
 private:
     AudioEngine() = default;
+    // join the device worker BEFORE members destruct: the singleton dies in
+    // exit handlers, and a PulseAudio/ALSA callback mid-render() would race
+    // the destruction of `snap` (asset shared_ptr double-free — found by
+    // ASAN via Light Show Studio's open+audio+exit smoke).
+    ~AudioEngine() { shutdown(); }
 
     struct ClipSnap
     {
