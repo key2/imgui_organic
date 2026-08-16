@@ -1,6 +1,6 @@
 // OrganicTimelineUI.h - the timeline editor window.
 // Draws a Sequence: time ruler (time or musical grid), cues, loop range, layer
-// headers (drag-reorder), clip lanes with drag & drop / resizing / fades /
+// headers (drag-reorder), clip lanes with drag & drop / resizing /
 // media looping / splitting, automation curve editing with easings + recorder
 // + multi-key transform box, gradient tracks, trigger layers, audio waveforms,
 // rubber-band (pre)selection, grid & magnet snapping, zoom & pan, playhead
@@ -76,6 +76,42 @@ public:
     // references (lightshow: the effect graph in the Node Graph panel).
     std::function<void(Clip&)> clipDoubleClicked;
 
+    // Host hook: 3D waveform. When set, an audio clip's waveform band asks
+    // the host for a TEXTURE of the visible media window [mediaT0, mediaT1]
+    // and draws it INSTEAD of the flat peak lines (the host renders it
+    // however it likes — Light Show Studio embeds the sndwave3d sculpted
+    // body). Return tex = 0 to fall back to the flat waveform (analysis
+    // pending, degenerate size...). UVs default to the GL render-target
+    // convention (flipped Y). Media-loop-tiled clips keep the flat path —
+    // the texture describes ONE media pass.
+    struct Waveform3DTex {
+        ImTextureID tex = (ImTextureID)0;
+        ImVec2 uv0 = ImVec2(0.f, 1.f), uv1 = ImVec2(1.f, 0.f);
+    };
+    std::function<Waveform3DTex(Clip&, double mediaT0, double mediaT1,
+                                ImVec2 sizePx, double playheadMediaT,
+                                bool enabled)> waveform3D;
+
+    // Companion hook: rotate the 3D waveform around the X axis. Organic
+    // owns the GESTURE — Alt + left-drag vertically on an audio clip —
+    // and calls this with the degree delta of the frame (0 to query);
+    // the host applies it to its camera (clamping as it likes) and
+    // returns the ABSOLUTE elevation, which organic shows as a live
+    // "N°" tooltip while the drag runs. Plain drags still move the
+    // clip; Alt pressed MID-drag keeps meaning snap-bypass.
+    std::function<float(Clip&, float deltaDeg)> waveform3DRotate;
+
+    // Analysis-section palette, exposed: the EXACT colors the structure
+    // row chips wear, so hosts can paint other surfaces (e.g. a 3D
+    // waveform driven by the section map) in the same language. The
+    // edm/song lookups return false for unknown labels;
+    // analysisSectionColor resolves combined labels the way the row
+    // does (exact match first, then EDM half, then song half) with a
+    // stable hash-hue fallback.
+    static bool edmPaletteColor(const std::string& label, ImVec4& out);
+    static bool songPaletteColor(const std::string& label, ImVec4& out);
+    static ImVec4 analysisSectionColor(const std::string& label, int row);
+
     // Zoom cluster (right-aligned on the toolbar row): zoom out / 1:1 /
     // zoom in / fit content (F and Ctrl+wheel still work). Hosts with an
     // icon font override the labels (e.g. Phosphor glyphs).
@@ -91,11 +127,12 @@ private:
         None, Scrub, Rubber, MoveClips, ResizeL, ResizeR,
         AutoKey, BezierA1, BezierA2, EaseHandle, GradKey, TriggerKey,
         LayerHeight, LayerReorder, HScroll, PanH,
-        Cue, LoopIn, LoopOut, FadeIn, FadeOut,
+        Cue, LoopIn, LoopOut,
         KeyBoxMove, KeyBoxL, KeyBoxR, KeyBoxT, KeyBoxB,
         // embedded clip-automation rows (Timeline v2)
         CAKey, CABez1, CABez2, CAEase, CAGKey,
-        PencilLane, PencilClip
+        PencilLane, PencilClip,
+        WaveRotate // Alt-drag on an audio clip: 3D waveform elevation
     };
 
     struct ClipRef { uint64_t clip = 0, layer = 0; double start = 0; };

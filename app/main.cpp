@@ -189,10 +189,8 @@ static void populateDemoProject(App& app)
     b1->setAudioFile("assets/beat.wav");
     Clip* b2 = audio->addClip(Clip::CType::Audio, "Beat", 4.0, 4.0);
     b2->setAudioFile("assets/beat.wav");
-    b2->fadeOutP->setValue(1.5f, false);
     Clip* sw = audio->addClip(Clip::CType::Audio, "Sweep", 8.0, 4.0);
     sw->setAudioFile("assets/sweep.wav");
-    sw->fadeInP->setValue(0.8f, false);
     Clip* tn = audio->addClip(Clip::CType::Audio, "Tone", 12.5, 3.0);
     tn->setAudioFile("assets/tone.wav");
     tn->loopMediaP->setValue(true, false);
@@ -246,8 +244,6 @@ static void populateDemoProject(App& app)
     Clip* loop = showAudio->addClip(Clip::CType::Audio, "Loop", 2.0, 10.0);
     loop->setAudioFile("assets/beat.wav");
     loop->loopMediaP->setValue(true, false);
-    loop->fadeInP->setValue(0.5f, false);
-    loop->fadeOutP->setValue(2.0f, false);
 
     show.addCue(2.0, "Start");
     show.addCue(6.0, "Drop");

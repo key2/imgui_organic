@@ -479,31 +479,13 @@ Clip::Clip(ClipLayer* l, CType t, const std::string& name)
         gainP   = addFloat("Gain", 1.f, 0.f, 4.f, "Playback / waveform gain");
         offsetP = addFloatUnbounded("Offset", 0.f, "Offset into the media, in seconds");
         offsetP->unit = "s"; offsetP->dragSpeed = 0.05f;
-        fadeInP  = addFloat("Fade In", 0.f, 0.f, 30.f, "Fade-in duration (seconds)");
-        fadeInP->unit = "s";
-        fadeOutP = addFloat("Fade Out", 0.f, 0.f, 30.f, "Fade-out duration (seconds)");
-        fadeOutP->unit = "s";
+        // no fade in/out params: this is a light-show tool, not a DAW — the
+        // audio output is a rehearsal reference (removed 2026-08-15; old
+        // blobs' saved "fadeIn"/"fadeOut" keys are skipped by Container::load)
         loopMediaP = addBool("Loop Media", false, "Tile the audio file to fill the clip");
         colorP->setValue(ImVec4(0.25f, 0.65f, 0.45f, 1.f));
         colorP->defaultValue = colorP->value;
     }
-}
-
-float Clip::fadeGainAt(double localT) const
-{
-    float g = 1.f;
-    if (fadeInP)
-    {
-        float fi = fadeInP->floatValue();
-        if (fi > 0.001f && localT < fi) g *= (float)(localT / fi);
-    }
-    if (fadeOutP)
-    {
-        float fo = fadeOutP->floatValue();
-        double len = length();
-        if (fo > 0.001f && localT > len - fo) g *= (float)((len - localT) / fo);
-    }
-    return std::max(0.f, std::min(1.f, g));
 }
 
 void Clip::setAudioFile(const std::string& path, bool adjustLength)
@@ -598,8 +580,9 @@ json Clip::save() const
     }
     // audio structure rows: only the FOLD state persists (the analysis
     // data itself is host-owned and re-fed on load)
-    if (structExpanded[0] || structExpanded[1])
-        j["structExp"] = json::array({ structExpanded[0], structExpanded[1] });
+    if (structExpanded[0] || structExpanded[1] || structExpanded[2])
+        j["structExp"] = json::array({ structExpanded[0], structExpanded[1],
+                                       structExpanded[2] });
     return j;
 }
 
@@ -611,6 +594,8 @@ void Clip::load(const json& j)
     {
         structExpanded[0] = j["structExp"][0].get<bool>();
         structExpanded[1] = j["structExp"][1].get<bool>();
+        // third fold (DSP curves) arrived later — old blobs carry two
+        structExpanded[2] = j["structExp"].size() >= 3 && j["structExp"][2].get<bool>();
     }
     automations.clear();
     if (j.contains("autos"))

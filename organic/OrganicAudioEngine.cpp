@@ -99,15 +99,16 @@ void AudioEngine::syncFromSequence(Sequence* seq)
                 s.length = c->length();
                 s.offset = c->offsetP->floatValue();
                 s.gain = c->gainP->floatValue();
-                s.fadeIn = c->fadeInP ? c->fadeInP->floatValue() : 0.f;
-                s.fadeOut = c->fadeOutP ? c->fadeOutP->floatValue() : 0.f;
                 s.loopMedia = c->loopMediaP && c->loopMediaP->boolValue();
                 next.clips.push_back(std::move(s));
             }
         }
     }
-    std::lock_guard<std::mutex> lock(snapMutex);
-    snap = std::move(next);
+    {
+        std::lock_guard<std::mutex> lock(snapMutex);
+        snap = std::move(next);
+    }
+    uiSyncGen.fetch_add(1); // publish: this snapshot corrects the mixer ONCE
 }
 
 static float sampleAsset(const AudioAsset& a, double mediaT, int channel)
@@ -141,11 +142,26 @@ void AudioEngine::render(float* out, unsigned int frames, int channels, int samp
         return;
     }
 
-    // drift correction against the UI clock
+    // drift correction against the UI clock — each transport snapshot is
+    // consumed at most ONCE. The UI syncs every rendered frame, so in
+    // normal operation nearly every callback corrects exactly as before;
+    // when the UI loop stalls (occluded/minimized window, hidden panel, a
+    // blocked vsync swap at a focus change) the generation freezes and the
+    // mixer FREE-RUNS at speed instead of machine-gunning hard resyncs
+    // against the frozen time (replaying the same 90 ms over and over —
+    // the unfocused-playback bug). When frames resume the transport
+    // catches up in one uncapped io.DeltaTime step, landing within a few
+    // ms of the free-run — the gentle pull re-converges inaudibly.
+    const uint64_t gen = uiSyncGen.load();
+    const bool freshSync = gen != lastSyncGen;
+    lastSyncGen = gen;
     double drift = audioTime - ui;
     double rateAdjust = 1.0;
-    if (std::fabs(drift) > 0.09) audioTime = ui;        // hard resync (seek/loop)
-    else rateAdjust = 1.0 - drift * 0.1;                // gentle pull
+    if (freshSync)
+    {
+        if (std::fabs(drift) > 0.09) audioTime = ui;    // hard resync (seek/loop)
+        else rateAdjust = 1.0 - drift * 0.1;            // gentle pull
+    }
 
     double dtPerFrame = (localSnap.speed * localSnap.direction * rateAdjust) / sampleRate;
     float master = masterVolume.load();
@@ -161,11 +177,7 @@ void AudioEngine::render(float* out, unsigned int frames, int channels, int samp
             double mediaT = c.offset + local;
             if (c.loopMedia && c.asset->buffer.duration() > 0.01)
                 mediaT = std::fmod(mediaT, c.asset->buffer.duration());
-            float env = c.gain;
-            if (c.fadeIn > 0.001f && local < c.fadeIn)
-                env *= (float)(local / c.fadeIn);
-            if (c.fadeOut > 0.001f && local > c.length - c.fadeOut)
-                env *= (float)((c.length - local) / c.fadeOut);
+            const float env = c.gain;
             mixL += sampleAsset(*c.asset, mediaT, 0) * env;
             mixR += sampleAsset(*c.asset, mediaT, 1) * env;
         }

@@ -1,11 +1,12 @@
 // OrganicAudioEngine.h - audio playback for timeline sequences (miniaudio).
-// Mixes the audio clips of a sequence at the transport position: gain, fades,
+// Mixes the audio clips of a sequence at the transport position: gain,
 // media offset, media looping, playback speed (also reversed for ping-pong).
 // The engine follows the UI transport clock with light drift correction.
 #pragma once
 
 #include "OrganicAudio.h"
 #include <atomic>
+#include <cstdint>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -50,7 +51,7 @@ private:
     {
         std::shared_ptr<AudioAsset> asset;
         double start = 0, length = 0, offset = 0;
-        float  gain = 1.f, fadeIn = 0.f, fadeOut = 0.f;
+        float  gain = 1.f;
         bool   loopMedia = false;
     };
     struct Snap
@@ -65,7 +66,15 @@ private:
     Snap snap;
 
     std::atomic<double> uiTime{ 0.0 };     // transport time from the UI thread
+    std::atomic<uint64_t> uiSyncGen{ 0 };  // bumped per syncFromSequence: the
+                                           // mixer consumes each transport
+                                           // snapshot at most ONCE — a frozen
+                                           // clock (stalled UI loop: occluded/
+                                           // minimized window, hidden panel, a
+                                           // blocked vsync swap) must never
+                                           // pull audio backwards repeatedly
     double audioTime = 0.0;                // audio-thread local clock
+    uint64_t lastSyncGen = 0;              // audio-thread: last consumed gen
     std::atomic<float> masterVolume{ 0.8f };
     std::atomic<bool>  muted{ false };
 

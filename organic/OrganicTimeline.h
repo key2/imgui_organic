@@ -133,8 +133,10 @@ public:
 // ---------------------------------------------------------------- AudioAnalysisView
 // Machine-listened facts about an audio clip's media, drawn as foldable
 // structure rows under the waveform and as the tracked beat grid: beats +
-// downbeats (beat tracker) and two labeled section maps (an EDM-structure
-// model and a general song-form model). HOST-FED: the embedding app owns
+// downbeats (beat tracker) and labeled section maps (an EDM-structure
+// model and a general song-form model — hosts may MERGE the two into one
+// map riding `edm` with combined labels like "drop-chorus", leaving `song`
+// empty and setting `edmTitle`). HOST-FED: the embedding app owns
 // the data (and its persistence) and refreshes this view whenever its
 // store changes — organic never serializes the data itself, only the two
 // fold flags on the clip. All times are MEDIA-LOCAL seconds (0 = start of
@@ -152,7 +154,53 @@ struct AudioAnalysisView
     std::string status;             // "" or a progress/error line to display
     int revision = 0;               // host bumps on change (cache invalidation)
 
-    bool hasData() const { return !beats.empty() || !edm.empty() || !song.empty(); }
+    // ---- classic-DSP extras (host-fed like everything above; all may be
+    // empty). Onsets/curves/boundaries draw under the waveform; the scalar
+    // facts render as clip-header chips.
+    std::vector<double> onsets;     // transient times (media s) — tick row
+    std::vector<double> boundaries; // unlabeled section-change candidates
+    struct Curve
+    {
+        std::vector<float> v;       // 0..1 samples
+        double rateHz = 0;
+        bool empty() const { return v.empty() || rateHz <= 0; }
+        float at(double t) const    // nearest sample, 0 outside
+        {
+            if (empty() || t < 0) return 0.f;
+            size_t i = (size_t)(t * rateHz);
+            return i < v.size() ? v[i] : 0.f;
+        }
+    };
+    Curve loud, low, mid, high, novelty;
+    bool edmIsDsp = false;          // edm row carries dsp FALLBACK sections
+                                    // (no labeled structure available)
+    // Row-0 title override ("" = "EDM"). Hosts that MERGE their structure
+    // maps into one list (combined labels like "drop-chorus" riding `edm`,
+    // `song` left empty) set the honest name here — e.g. "SECTIONS".
+    std::string edmTitle;
+    // chips (0 / empty = unknown)
+    std::string key;                // "F minor"
+    float keyStrength = 0;
+    bool  keyAgree = false;         // both profile families agree
+    float tuningHz = 0;
+    float lufs = 0, rangeLu = 0, truePeakDb = 0, trackGainDb = 0;
+    float dspBpm = 0, dspBpmConf = 0, dspBpmStability = 0;
+    bool  bpmMismatch = false;      // dsp estimate disagrees with the grid
+    float danceability = 0;
+    float qcClipPct = 0; int qcClipRuns = 0;
+    float qcHumDb = -120, qcHumHz = 0; int qcGaps = 0;
+
+    bool hasCurves() const
+    {
+        return !loud.empty() || !low.empty() || !mid.empty() || !high.empty() ||
+               !novelty.empty();
+    }
+    bool hasQcIssue() const
+    {
+        return qcClipPct > 0.1f || qcHumDb > 10.f || qcGaps > 0;
+    }
+    bool hasData() const { return !beats.empty() || !edm.empty() || !song.empty() ||
+                                  hasCurves() || !onsets.empty(); }
     bool hasRows() const { return !edm.empty() || !song.empty() || !status.empty(); }
     // index of the section containing t (media seconds), -1 when none
     static int sectionAt(const std::vector<Section>& v, double t);
@@ -178,18 +226,18 @@ public:
     Parameter* fileP    = nullptr;
     Parameter* gainP    = nullptr;
     Parameter* offsetP  = nullptr; // seconds into the media
-    Parameter* fadeInP  = nullptr; // seconds
-    Parameter* fadeOutP = nullptr; // seconds
     Parameter* loopMediaP = nullptr; // tile the media to fill the clip
 
     std::shared_ptr<AudioAsset> asset; // waveform data (audio clips)
 
-    // audio structure analysis (audio clips): host-fed data + two foldable
-    // rows under the waveform — row 0 = the EDM structure map, row 1 = the
-    // song-form map. Fold flags persist with the clip; anim is runtime.
+    // audio structure analysis (audio clips): host-fed data + foldable
+    // rows under the waveform — row 0 = the labeled structure map (EDM, or
+    // the host's merged EDM×SONG map), row 1 = the song-form map (empty
+    // when merged into row 0), row 2 = the DSP curve strips
+    // (loud/bands/novelty). Fold flags persist with the clip; anim is runtime.
     AudioAnalysisView analysis;
-    bool  structExpanded[2] = { false, false };
-    float structAnim[2] = { -1.f, -1.f };
+    bool  structExpanded[3] = { false, false, false };
+    float structAnim[3] = { -1.f, -1.f, -1.f };
 
     // embedded automations (Block clips): the block contains its automation
     // rows — as many internal rows as the effect has automated parameters
@@ -199,7 +247,6 @@ public:
     double length() const { return lengthP->floatValue(); }
     double end()    const { return start() + length(); }
     bool   enabled() const { return enabledP->boolValue(); }
-    float  fadeGainAt(double localT) const; // fade envelope (1 when no fades)
 
     ClipAutomation* addAutomation(ClipAutomation::AKind kind,
                                   const std::string& name,
