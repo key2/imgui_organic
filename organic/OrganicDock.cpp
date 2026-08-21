@@ -108,12 +108,13 @@ void DockManager::gui()
             p.draw(&p.open);
 }
 
-void DockManager::panelsMenu()
+void DockManager::panelsMenu(const std::function<void()>& extra)
 {
     if (ImGui::BeginMenu("Panels"))
     {
         for (auto& p : panels)
             ImGui::MenuItem(p.name.c_str(), nullptr, &p.open);
+        if (extra) extra(); // app-specific entries (e.g. lightshow's NDI submenu)
         ImGui::Separator();
         if (ImGui::MenuItem("Open All"))
             for (auto& p : panels) p.open = true;

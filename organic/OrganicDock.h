@@ -34,7 +34,10 @@ public:
     // Call once per frame inside the frame: draws dockspace host + all open panels.
     void gui();
     // Menus (call between BeginMainMenuBar/EndMainMenuBar).
-    void panelsMenu();
+    // `extra` (optional) draws app-specific entries inside the Panels menu,
+    // between the panel toggles and the Open All row — lightshow adds its
+    // NDI stream-window submenu there (Panels ▸ NDI ▸ <stream>).
+    void panelsMenu(const std::function<void()>& extra = {});
     void viewMenu();
     // Modal popups host (call at top level, after menus).
     void popupsGui();
