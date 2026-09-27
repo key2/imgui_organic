@@ -210,6 +210,17 @@ Layers:
 | Reorder / duplicate / delete | header right-click menu |
 | Resize height | drag the bottom edge of the header |
 
+**One selection at a time.** Keys (embedded automation rows and classic lanes)
+and clips are selected through different state, but the editor keeps them
+exclusive: a plain click — left or right — on anything that is not a key drops
+every key selection in every row and lane; a plain click on an unselected key
+makes it the only selected key anywhere (its clip / layer becomes the context
+selection); `Ctrl` extends and drops nothing (multi-row / multi-lane key
+selections). `Del` removes **the finest thing selected**: any selected key
+before any selected clip — so `Del` right after clicking a key deletes the key,
+never its block, and a second `Del` (no key left selected) deletes the block.
+Programmatically: `Sequence::anyKeySelected()` / `clearKeySelections()`.
+
 Everything above is **undoable** (`Ctrl+Z` / `Ctrl+Shift+Z` or `Ctrl+Y`), including
 drags, drops, renames, key edits, recordings, ripple edits and parameter changes
 (continuous edits collapse into a single undo step, like organicui).
@@ -512,6 +523,18 @@ and `ClipLayer::resolveOverlap(t, len)` gives code the same nearest-free-spot
 answer. **Pencil mode** (`P` / toolbar) lets the user draw curves freehand
 across any automation editor; programmatically the same landing is
 `applyDrawnPoints(points, method, tolerance)`.
+
+Starting over is a right-click away: a row's menu offers *Clear Keys* (this
+row) and *Clear Block Automation* (every row of the block); the block's own
+menu offers *Clear Automation* for the selected blocks. All three empty the
+curves / gradients so they can be redrawn and keep the rows themselves —
+identity, name, host tag, range, arm state and expansion — one undo step each.
+A recording take in flight is discarded by the clear (it would otherwise
+re-populate the row when it stops). Programmatically:
+`ClipAutomation::clearKeys()` / `hasKeys()` and `Clip::clearAutomationKeys()`
+/ `hasAutomationKeys()`. Removing a row altogether is a different operation
+(*Remove Automation* → `Clip::removeAutomation`, or the host's
+`removeAutomationHook`).
 
 ### 3.6 Drag & drop media
 

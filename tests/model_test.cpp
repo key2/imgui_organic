@@ -156,6 +156,50 @@ static void testClipAutomations()
     r->stopRecordingAndApply();
     CHECK(r->keys.size() >= 2);
     CHECK(std::fabs(r->valueAt(2.0) - 1.f) < 0.1f);
+
+    // clearing the block's automation empties every row for redrawing but
+    // keeps the rows (identity, target, range, expansion) — unlike removal
+    CHECK(c->hasAutomationKeys());
+    const size_t rows = c->automations.size();
+    const uint64_t rateId = a->id;
+    a->rangeMax = 2.f;
+    a->expanded = true;
+    a->selectedKeys.insert(a->keys.front().id);
+    json pre = a->keysToJson();
+    CHECK(c->clearAutomationKeys() == 3);       // rate, color, amount all had keys
+    CHECK(!c->hasAutomationKeys());
+    CHECK(c->automations.size() == rows);
+    CHECK(c->findAutomation(rateId) == a && c->findAutomationByTarget("1:rate") == a);
+    CHECK(a->keys.empty() && a->selectedKeys.empty() && !a->hasKeys());
+    CHECK(g->gkeys.empty() && !g->hasKeys());
+    CHECK(std::fabs(a->rangeMax - 2.f) < 1e-6 && a->expanded && a->target == "1:rate");
+    CHECK(c->clearAutomationKeys() == 0);       // idempotent: nothing left to clear
+    CHECK(!a->clearKeys());
+    // the undo record is the row's keys json: restoring it brings back the
+    // same keys (ids included), and the row can be redrawn from empty
+    a->keysFromJson(pre);
+    CHECK(a->keysToJson() == pre);
+    CHECK(a->clearKeys());
+    a->applyDrawnPoints(stroke, 1, 0.05f);
+    CHECK(a->keys.size() >= 2 && c->hasAutomationKeys());
+    // a take in flight is discarded by the clear (it would otherwise
+    // re-populate the row when it stops); the arm state is kept. The
+    // return value reports removed KEYS only — a dropped take is not an
+    // undo-worthy change.
+    r->recArm = true;
+    for (int i = 0; i <= 10; i++) r->updateRecording(i * 0.1, 0.5f);
+    CHECK(r->recording && r->recPoints.size() >= 2);
+    CHECK(!r->clearKeys());                     // the block clear above left no key
+    CHECK(!r->recording && r->recPoints.empty() && r->recArm && r->keys.empty());
+    r->addKey(0.0, 0.1f);
+    for (int i = 0; i <= 10; i++) r->updateRecording(i * 0.1, 0.5f);
+    CHECK(r->recording && r->recPoints.size() >= 2);
+    CHECK(r->clearKeys());                      // this time a key went
+    CHECK(!r->recording && r->recPoints.empty() && r->recArm && r->keys.empty());
+    r->updateRecording(1.2, 0.25f);             // armed: a fresh take starts here
+    CHECK(r->recording && r->recPoints.size() == 1 && r->recPoints.front().first == 1.2);
+    r->stopRecordingAndApply();                 // one point is not a take
+    CHECK(r->keys.empty() && !r->recArm);
 }
 
 static void testClipOverlapRules()
@@ -387,6 +431,63 @@ static void testGradientHold()
     CHECK(mid.x < 0.01f); // held, no interpolation
 }
 
+static void testKeySelections()
+{
+    // ONE selection at a time: key selections live in per-row sets (embedded
+    // automations of every block) and per-layer sets (classic lanes). The
+    // editor sweeps them all on every plain click that is not a key, and
+    // Delete removes keys before clips whenever any key is selected — both
+    // ride these two model helpers.
+    Sequence seq("Seq");
+    auto* cl = static_cast<ClipLayer*>(seq.addLayer(Layer::LType::Clips, "FX"));
+    Clip* a = cl->addClip(Clip::CType::Block, "A", 0.0, 4.0);
+    Clip* b = cl->addClip(Clip::CType::Block, "B", 4.0, 4.0);
+    ClipAutomation* ra = a->addAutomation(ClipAutomation::AKind::Curve, "rate");
+    ClipAutomation* rb = b->addAutomation(ClipAutomation::AKind::Gradient, "color");
+    auto* al = static_cast<AutomationLayer*>(seq.addLayer(Layer::LType::Automation, "Lane"));
+    auto* gl = static_cast<GradientLayer*>(seq.addLayer(Layer::LType::Gradient, "Grad"));
+    auto* tl = static_cast<TriggerLayer*>(seq.addLayer(Layer::LType::Triggers, "Trig"));
+    const uint64_t ka = ra->addKey(1.0, 0.5f)->id;
+    const uint64_t kb = rb->addGradKey(1.0, ImVec4(1, 0, 0, 1))->id;
+    const uint64_t kl = al->addKey(1.0, 0.5f)->id;
+    const uint64_t kg = gl->addKey(1.0, ImVec4(0, 1, 0, 1))->id;
+    const uint64_t kt = tl->addTrigger(1.0, "Go")->id;
+    CHECK(!seq.anyKeySelected());
+
+    // every holder is seen on its own ...
+    ra->selectedKeys.insert(ka);
+    CHECK(seq.anyKeySelected());
+    seq.clearKeySelections();
+    CHECK(!seq.anyKeySelected() && ra->selectedKeys.empty());
+    rb->selectedKeys.insert(kb);
+    CHECK(seq.anyKeySelected());
+    seq.clearKeySelections();
+    al->selectedKeys.insert(kl);
+    CHECK(seq.anyKeySelected());
+    seq.clearKeySelections();
+    gl->selectedKeys.insert(kg);
+    CHECK(seq.anyKeySelected());
+    seq.clearKeySelections();
+    tl->selectedKeys.insert(kt);
+    CHECK(seq.anyKeySelected());
+
+    // ... and one sweep drops them all at once, keys untouched
+    ra->selectedKeys.insert(ka);
+    rb->selectedKeys.insert(kb);
+    al->selectedKeys.insert(kl);
+    gl->selectedKeys.insert(kg);
+    seq.clearKeySelections();
+    CHECK(!seq.anyKeySelected());
+    CHECK(ra->selectedKeys.empty() && rb->selectedKeys.empty() && al->selectedKeys.empty() &&
+          gl->selectedKeys.empty() && tl->selectedKeys.empty());
+    CHECK(ra->keys.size() == 1 && rb->gkeys.size() == 1 && al->keys.size() == 1 &&
+          gl->keys.size() == 1 && tl->triggers.size() == 1);
+    // a selected clip is not a key selection
+    a->select();
+    CHECK(a->isSelected() && !seq.anyKeySelected());
+    Selection::get().clear();
+}
+
 static void testWav()
 {
     AudioBuffer buf = makeTone(0.5f, 440.f);
@@ -409,6 +510,7 @@ int main()
     testSequenceStructure();
     testClipAutomations();
     testClipOverlapRules();
+    testKeySelections();
     testAutomation();
     testRangeRemap();
     testTriggersAndCues();

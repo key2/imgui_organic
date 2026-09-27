@@ -15,7 +15,11 @@ static const float LANE_GAP  = 2.f;
 static const float VAL_MARGIN = 5.f;
 
 static const double RULER_STEPS[] = { 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5,
-                                      1, 2, 5, 10, 15, 30, 60, 120, 300, 600 };
+                                      1, 2, 5, 10, 15, 30, 60, 120, 300, 600,
+                                      // hour scale — day-length sequences
+                                      // (e.g. a 24 h master timeline) need
+                                      // legible steps far past 10 min
+                                      900, 1800, 3600, 7200, 14400, 21600, 43200 };
 
 // ---------------------------------------------------------------- small helpers
 static ImU32 col32(const ImVec4& c, float aMul = 1.f)
@@ -491,6 +495,24 @@ static void pushContentEdit(Sequence* seq, const json& pre, const std::string& n
 // ---------------------------------------------------------------- TimelineUI
 TimelineUI::TimelineUI() {}
 
+Clip* TimelineUI::clipFromMediaPayload(ClipLayer* cl, double t, const MediaPayload& mp)
+{
+    if (!cl) return nullptr;
+    const double len = mp.duration > 0 ? mp.duration : 2.0;
+    Clip* c = cl->addClip(mp.kind == 1 ? Clip::CType::Audio : Clip::CType::Block,
+                          mp.name[0] ? mp.name : "Clip", t, len);
+    if (!c) return nullptr;
+    ImVec4 col(mp.color[0], mp.color[1], mp.color[2], mp.color[3]);
+    c->colorP->setValue(col, false);
+    c->colorP->defaultValue = col;
+    if (mp.kind == 1 && mp.file[0]) c->setAudioFile(mp.file, mp.duration <= 0);
+    // a Block clip's payload `file` is the host's opaque resource URI
+    // (lightshow: "graph://<GraphId>") — it IS the block's identity, the
+    // name is only what shows until the host renames it
+    if (mp.kind == 0) c->hostBinding = mp.file;
+    return c;
+}
+
 double TimelineUI::snapStep(const Sequence& seq, double pps) const
 {
     if (gridMode == 1) // beats
@@ -728,7 +750,9 @@ void TimelineUI::toolbar(Sequence& seq)
     ImGui::Checkbox("Follow", &followPlayhead);
 
     ImGui::SameLine(0, 14);
-    if (ImGui::Button("+ Layer")) ImGui::OpenPopup("add_layer_toolbar");
+    const bool anyLayerOffer = offerClipLayers || offerAutomationLayers ||
+                               offerGradientLayers || offerTriggerLayers;
+    if (anyLayerOffer && ImGui::Button("+ Layer")) ImGui::OpenPopup("add_layer_toolbar");
     if (ImGui::BeginPopup("add_layer_toolbar"))
     {
         Sequence* sp = &seq;
@@ -807,7 +831,7 @@ void TimelineUI::body(Sequence& seq)
 
     double& viewStart = seq.viewStart;
     double& pps       = seq.pixelsPerSecond;
-    pps = std::max(2.0, std::min(4000.0, pps));
+    pps = std::max(minPps, std::min(4000.0, pps));
 
     ImVec2 avail  = ImGui::GetContentRegionAvail();
     if (avail.x < 80 || avail.y < 70) { ImGui::PopID(); return; }
@@ -845,7 +869,7 @@ void TimelineUI::body(Sequence& seq)
         fitRequested = false;
         viewStart = 0;
         const double fitTarget = fitEnd > 0 ? fitEnd : contentEnd;
-        pps = std::max(2.0, std::min(4000.0, laneW / std::max(1.0, fitTarget * 1.02)));
+        pps = std::max(minPps, std::min(4000.0, laneW / std::max(1.0, fitTarget * 1.02)));
     }
     if (zoomRequest != 0 || zoomOneRequested)
     {
@@ -853,7 +877,7 @@ void TimelineUI::body(Sequence& seq)
         // material under the eye stays put while the scale changes
         const double center = viewStart + laneW * 0.5 / pps;
         if (zoomOneRequested) pps = 80.0; // 1:1 = the model's default scale
-        else pps = std::max(2.0, std::min(4000.0, pps * std::pow(1.45, (double)zoomRequest)));
+        else pps = std::max(minPps, std::min(4000.0, pps * std::pow(1.45, (double)zoomRequest)));
         viewStart = std::max(0.0, center - laneW * 0.5 / pps);
         zoomRequest = 0;
         zoomOneRequested = false;
@@ -1571,25 +1595,24 @@ void TimelineUI::body(Sequence& seq)
         ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
 
     // ============================================================ OPERATION HELPERS
+    // Delete removes the FINEST thing selected. Any selected key — in an
+    // embedded automation row or a classic lane — takes precedence over the
+    // selected clips: clicking a key selects its clip as context (Inspector,
+    // block outline), and that context must not die with the key. With no
+    // key selected anywhere, the selected clips go (with everything inside).
+    // Plain clicks keep the selection exclusive (see the LEFT PRESS cases), so
+    // "the finest thing selected" is what the user last picked.
     auto deleteSelection = [&]()
     {
-        struct ClipRec { uint64_t layer; json data; };
-        std::vector<ClipRec> clipRecs;
-        for (Clip* c : Selection::get().getAs<Clip>())
-            if (c->layer && c->layer->sequence == sp)
-                clipRecs.push_back({ c->layer->id, c->save() });
-
         // selected keys inside embedded clip automations
         struct CARec { uint64_t clip, cauto; json pre, post; };
         std::vector<CARec> caRecs;
-        bool clipDeleted = !clipRecs.empty();
         for (auto& l : seq.layers)
         {
             auto* cl = dynamic_cast<ClipLayer*>(l.get());
             if (!cl) continue;
             for (auto& c : cl->clips)
             {
-                if (clipDeleted && c->isSelected()) continue; // dies whole
                 for (auto& a : c->automations)
                 {
                     if (a->selectedKeys.empty()) continue;
@@ -1631,6 +1654,14 @@ void TimelineUI::body(Sequence& seq)
                 keyRecs.push_back({ tl->id, pre, tl->keysToJson() });
             }
         }
+
+        // no key selected anywhere: the selected clips die whole
+        struct ClipRec { uint64_t layer; json data; };
+        std::vector<ClipRec> clipRecs;
+        if (caRecs.empty() && keyRecs.empty())
+            for (Clip* c : Selection::get().getAs<Clip>())
+                if (c->layer && c->layer->sequence == sp)
+                    clipRecs.push_back({ c->layer->id, c->save() });
         for (auto& r : clipRecs)
             if (auto* cl = dynamic_cast<ClipLayer*>(seq.findLayer(r.layer)))
                 cl->removeClip(r.data.value("id", (uint64_t)0));
@@ -1675,6 +1706,40 @@ void TimelineUI::body(Sequence& seq)
             { sp });
     };
 
+    // clear the automation of whole effect blocks: every row's curve /
+    // gradient is wiped so it can be redrawn, the rows stay (the block keeps
+    // its automation layout; a host's flags are untouched — unlike "Remove
+    // Automation"). One undo step restores every row's keys. Blocks of other
+    // sequences and rows that were already empty are left alone.
+    auto clearClipAutomation = [&](const std::vector<Clip*>& blocks)
+    {
+        struct CARec { uint64_t clip, cauto; json pre, post; };
+        std::vector<CARec> recs;
+        for (Clip* c : blocks)
+        {
+            if (!c || !c->layer || c->layer->sequence != sp) continue;
+            for (auto& a : c->automations)
+            {
+                if (!a->hasKeys()) continue;
+                json pre = a->keysToJson();
+                a->clearKeys();
+                recs.push_back({ c->id, a->id, pre, a->keysToJson() });
+            }
+        }
+        if (recs.empty()) return;
+        auto apply = [sp, recs](bool post)
+        {
+            for (auto& r : recs)
+                if (Clip* c = sp->findClip(r.clip))
+                    if (ClipAutomation* a = c->findAutomation(r.cauto))
+                        a->keysFromJson(post ? r.post : r.pre);
+        };
+        UndoManager::get().pushDone("Clear Automation",
+            [apply] { apply(true); },
+            [apply] { apply(false); },
+            { sp });
+    };
+
     auto duplicateSelection = [&]()
     {
         auto clips = Selection::get().getAs<Clip>();
@@ -1684,15 +1749,15 @@ void TimelineUI::body(Sequence& seq)
         struct Rec { uint64_t layer; json data; };
         std::vector<Rec> recs;
         Selection::get().clear();
+        seq.clearKeySelections(); // the copies are the selection
         for (Clip* c : mine)
         {
             json j = c->save();
-            j["id"] = seq.newId();
             // land the copy in the nearest free spot (blocks never stack)
             j["params"]["start"] = (float)c->layer->resolveOverlap(c->end(), c->length());
-            Clip* nc = c->layer->addClipFromJson(j);
+            Clip* nc = c->layer->addClipFromJson(j, true);
             Selection::get().add(nc);
-            recs.push_back({ c->layer->id, j });
+            recs.push_back({ c->layer->id, nc->save() });
         }
         UndoManager::get().pushDone("Duplicate",
             [sp, recs]
@@ -1713,6 +1778,7 @@ void TimelineUI::body(Sequence& seq)
     auto selectAllClips = [&]()
     {
         Selection::get().clear();
+        seq.clearKeySelections(); // "all CLIPS": Delete must then reach the clips
         for (auto& l : seq.layers)
             if (auto* cl = dynamic_cast<ClipLayer*>(l.get()))
                 for (auto& c : cl->clips) Selection::get().add(c.get());
@@ -1748,10 +1814,8 @@ void TimelineUI::body(Sequence& seq)
         double cut = t - c->start();
 
         json a = orig;
-        a["id"] = seq.newId();
         a["params"]["length"] = (float)cut;
         json b = orig;
-        b["id"] = seq.newId();
         b["params"]["start"] = (float)t;
         b["params"]["length"] = (float)(c->length() - cut);
         if (b["params"].contains("offset"))
@@ -1784,8 +1848,9 @@ void TimelineUI::body(Sequence& seq)
 
         uint64_t origId = c->id;
         cl->removeClip(origId);
-        cl->addClipFromJson(a);
-        Clip* nb = cl->addClipFromJson(b);
+        a = cl->addClipFromJson(a, true)->save();
+        Clip* nb = cl->addClipFromJson(b, true);
+        b = nb->save();
         if (nb) nb->select();
         UndoManager::get().pushDone("Split Clip",
             [sp, layerId, origId, a, b]
@@ -1868,6 +1933,7 @@ void TimelineUI::body(Sequence& seq)
             struct Rec { uint64_t layer; json data; };
             std::vector<Rec> recs;
             Selection::get().clear();
+            seq.clearKeySelections(); // the pasted clips are the selection
             for (auto& e : env["clips"])
             {
                 uint64_t layerId = e.value("layer", (uint64_t)0);
@@ -1879,13 +1945,12 @@ void TimelineUI::body(Sequence& seq)
                 }
                 if (!cl) return;
                 json data = e["data"];
-                data["id"] = seq.newId();
                 const double wantT = data["params"].value("start", 0.f) - anchor + at;
                 const double wantLen = data["params"].value("length", 4.f);
                 data["params"]["start"] = (float)cl->resolveOverlap(wantT, wantLen);
-                Clip* nc = cl->addClipFromJson(data);
+                Clip* nc = cl->addClipFromJson(data, true);
                 if (nc) Selection::get().add(nc);
-                recs.push_back({ cl->id, data });
+                recs.push_back({ cl->id, nc->save() });
             }
             if (recs.empty()) return;
             UndoManager::get().pushDone("Paste Clips",
@@ -1958,7 +2023,15 @@ void TimelineUI::body(Sequence& seq)
     auto stripIds = [](json& j)
     {
         if (j.contains("id")) j["id"] = 0;
-        if (j.contains("clips")) for (auto& c : j["clips"]) if (c.contains("id")) c["id"] = 0;
+        if (j.contains("clips")) for (auto& c : j["clips"])
+        {
+            c["id"] = 0;
+            if (c.contains("autos")) for (auto& row : c["autos"])
+            {
+                row["id"] = 0;
+                if (row.contains("keys")) for (auto& key : row["keys"]) key["id"] = 0;
+            }
+        }
         if (j.contains("keys")) for (auto& k : j["keys"]) if (k.contains("id")) k["id"] = 0;
     };
 
@@ -1997,12 +2070,8 @@ void TimelineUI::body(Sequence& seq)
     {
         const double len = mp.duration > 0 ? mp.duration : 2.0;
         t = cl->resolveOverlap(t, len); // blocks never stack on one track
-        Clip* c = cl->addClip(mp.kind == 1 ? Clip::CType::Audio : Clip::CType::Block,
-                              mp.name[0] ? mp.name : "Clip", t, len);
-        ImVec4 col(mp.color[0], mp.color[1], mp.color[2], mp.color[3]);
-        c->colorP->setValue(col, false);
-        c->colorP->defaultValue = col;
-        if (mp.kind == 1 && mp.file[0]) c->setAudioFile(mp.file, mp.duration <= 0);
+        Clip* c = clipFromMediaPayload(cl, t, mp);
+        if (!c) return c;
         pushClipAdded(sp, cl->id, c->save(), "Drop Media");
         c->select();
         return c;
@@ -2014,7 +2083,7 @@ void TimelineUI::body(Sequence& seq)
         if (io.KeyCtrl)
         {
             double tAtMouse = xToTime(mouse.x);
-            pps = std::max(2.0, std::min(4000.0, pps * std::pow(1.18, (double)io.MouseWheel)));
+            pps = std::max(minPps, std::min(4000.0, pps * std::pow(1.18, (double)io.MouseWheel)));
             viewStart = std::max(0.0, tAtMouse - (mouse.x - cLaneX0) / pps);
         }
         else if (io.KeyShift)
@@ -2071,8 +2140,13 @@ void TimelineUI::body(Sequence& seq)
             }
             break;
         }
+        // ONE selection at a time: a plain click on anything that is not a
+        // key drops every key selection (rows of every block, classic lanes)
+        // so a later Delete only reaches what was picked last; Ctrl extends
+        // and drops nothing. Keys themselves: see the *Key cases below.
         case Hit::Header:
         {
+            if (!io.KeyCtrl) seq.clearKeySelections();
             hit.layer->select(io.KeyCtrl);
             if (dbl)
             {
@@ -2102,6 +2176,7 @@ void TimelineUI::body(Sequence& seq)
         {
             if (dbl)
             {
+                seq.clearKeySelections();
                 hit.clip->select();
                 // host hook: open/edit what the block references (e.g. the
                 // effect graph in the app's node editor)
@@ -2122,7 +2197,13 @@ void TimelineUI::body(Sequence& seq)
             }
             bool wasSelected = hit.clip->isSelected();
             if (io.KeyCtrl) { Selection::get().toggle(hit.clip); }
-            else if (!wasSelected) { Selection::get().set(hit.clip); }
+            else
+            {
+                // the clip is what the user works with now — even when it was
+                // already selected (a key click selects its clip as context)
+                seq.clearKeySelections();
+                if (!wasSelected) Selection::get().set(hit.clip);
+            }
             if (!hit.clip->isSelected()) break;
 
             drag = Drag::MoveClips;
@@ -2138,6 +2219,7 @@ void TimelineUI::body(Sequence& seq)
         case Hit::ClipL:
         case Hit::ClipR:
         {
+            if (!io.KeyCtrl) seq.clearKeySelections();
             if (!hit.clip->isSelected()) Selection::get().set(hit.clip);
             drag = (hit.kind == Hit::ClipL) ? Drag::ResizeL : Drag::ResizeR;
             dragItemId = hit.clip->id;
@@ -2153,6 +2235,7 @@ void TimelineUI::body(Sequence& seq)
             // expand / collapse the automation row (smooth: uiAnim eases,
             // block + track heights follow)
             hit.cauto->expanded = !hit.cauto->expanded;
+            if (!io.KeyCtrl) seq.clearKeySelections();
             hit.clip->select();
             break;
         }
@@ -2160,6 +2243,7 @@ void TimelineUI::body(Sequence& seq)
         {
             // expand / collapse the audio structure row (same smooth fold)
             hit.clip->structExpanded[hit.aaRow] = !hit.clip->structExpanded[hit.aaRow];
+            if (!io.KeyCtrl) seq.clearKeySelections();
             hit.clip->select();
             break;
         }
@@ -2174,6 +2258,7 @@ void TimelineUI::body(Sequence& seq)
                             secs[(size_t)hit.aaSection].t0;
                 seq.setTime(std::max(0.0, tl));
             }
+            if (!io.KeyCtrl) seq.clearKeySelections();
             hit.clip->select();
             break;
         }
@@ -2182,11 +2267,17 @@ void TimelineUI::body(Sequence& seq)
             hit.cauto->recArm = !hit.cauto->recArm;
             if (!hit.cauto->recArm && hit.cauto->recording)
                 hit.cauto->stopRecordingAndApply();
+            if (!io.KeyCtrl) seq.clearKeySelections();
             hit.clip->select();
             break;
         }
         case Hit::CAKey:
         {
+            // a plain click on an unselected key makes it THE selection —
+            // across every row of every block and every lane, not only this
+            // row (a stale key elsewhere would otherwise still be deleted by
+            // the next Del); a plain click on an already selected key keeps
+            // the selection so it can be dragged; Ctrl toggles (multi-row)
             ClipAutomation* a = hit.cauto;
             if (io.KeyCtrl)
             {
@@ -2195,7 +2286,7 @@ void TimelineUI::body(Sequence& seq)
             }
             else if (!a->selectedKeys.count(hit.keyId))
             {
-                a->selectedKeys.clear();
+                seq.clearKeySelections();
                 a->selectedKeys.insert(hit.keyId);
             }
             hit.clip->select();
@@ -2245,7 +2336,7 @@ void TimelineUI::body(Sequence& seq)
             }
             else if (!a->selectedKeys.count(hit.keyId))
             {
-                a->selectedKeys.clear();
+                seq.clearKeySelections(); // exclusive, like CAKey
                 a->selectedKeys.insert(hit.keyId);
             }
             hit.clip->select();
@@ -2283,12 +2374,14 @@ void TimelineUI::body(Sequence& seq)
                         if (rg.a == a) nv = caRowYToNorm(rg, mouse.y);
                     k = a->addKey(localT, a->rangeMin + nv * (a->rangeMax - a->rangeMin));
                 }
-                a->selectedKeys.clear();
+                seq.clearKeySelections();
                 a->selectedKeys.insert(k->id);
                 hit.clip->select();
                 pushClipAutoKeysEdit(sp, hit.clip->id, a->id, pre, a->keysToJson(), "Add Key");
                 break;
             }
+            // empty curve space is "something else" for any key selected so far
+            if (!io.KeyCtrl) seq.clearKeySelections();
             if (pencilMode)
             {
                 // pencil: draw the curve freehand across the editor
@@ -2312,12 +2405,13 @@ void TimelineUI::body(Sequence& seq)
             {
                 json pre = a->keysToJson();
                 GradKey* k = a->addGradKey(localT, a->colorAt(localT));
-                a->selectedKeys.clear();
+                seq.clearKeySelections();
                 a->selectedKeys.insert(k->id);
                 hit.clip->select();
                 pushClipAutoKeysEdit(sp, hit.clip->id, a->id, pre, a->keysToJson(), "Add Color Key");
                 break;
             }
+            if (!io.KeyCtrl) seq.clearKeySelections();
             hit.clip->select();
             break;
         }
@@ -2331,7 +2425,7 @@ void TimelineUI::body(Sequence& seq)
             }
             else if (!al->selectedKeys.count(hit.keyId))
             {
-                al->selectedKeys.clear();
+                seq.clearKeySelections(); // exclusive across lanes and rows
                 al->selectedKeys.insert(hit.keyId);
             }
             al->select();
@@ -2378,7 +2472,7 @@ void TimelineUI::body(Sequence& seq)
             }
             else if (!gl->selectedKeys.count(hit.keyId))
             {
-                gl->selectedKeys.clear();
+                seq.clearKeySelections();
                 gl->selectedKeys.insert(hit.keyId);
             }
             gl->select();
@@ -2400,7 +2494,7 @@ void TimelineUI::body(Sequence& seq)
             }
             else if (!tl->selectedKeys.count(hit.keyId))
             {
-                tl->selectedKeys.clear();
+                seq.clearKeySelections();
                 tl->selectedKeys.insert(hit.keyId);
             }
             tl->select();
@@ -2423,6 +2517,7 @@ void TimelineUI::body(Sequence& seq)
                     Clip* c = cl->addClip(Clip::CType::Block, "Clip",
                                           cl->resolveOverlap(t, len), len);
                     pushClipAdded(sp, cl->id, c->save(), "Add Clip");
+                    seq.clearKeySelections();
                     c->select();
                 }
                 else if (auto* al = dynamic_cast<AutomationLayer*>(hit.layer))
@@ -2437,7 +2532,7 @@ void TimelineUI::body(Sequence& seq)
                         float v = mn + std::max(0.f, std::min(1.f, yToNorm(*laneAtY(mouse.y), mouse.y))) * (mx - mn);
                         k = al->addKey(t, v);
                     }
-                    al->selectedKeys.clear();
+                    seq.clearKeySelections();
                     al->selectedKeys.insert(k->id);
                     al->select();
                     pushKeysEdit(sp, al->id, pre, al->keysToJson(), "Add Key");
@@ -2446,7 +2541,7 @@ void TimelineUI::body(Sequence& seq)
                 {
                     json pre = gl->keysToJson();
                     GradKey* k = gl->addKey(t, gl->colorAt(t));
-                    gl->selectedKeys.clear();
+                    seq.clearKeySelections();
                     gl->selectedKeys.insert(k->id);
                     gl->select();
                     pushKeysEdit(sp, gl->id, pre, gl->keysToJson(), "Add Color Key");
@@ -2455,7 +2550,7 @@ void TimelineUI::body(Sequence& seq)
                 {
                     json pre = tl->keysToJson();
                     TimeTrigger* tt = tl->addTrigger(t);
-                    tl->selectedKeys.clear();
+                    seq.clearKeySelections();
                     tl->selectedKeys.insert(tt->id);
                     tl->select();
                     pushKeysEdit(sp, tl->id, pre, tl->keysToJson(), "Add Trigger");
@@ -2466,6 +2561,7 @@ void TimelineUI::body(Sequence& seq)
             if (pencilMode && dynamic_cast<AutomationLayer*>(hit.layer))
             {
                 auto* al = static_cast<AutomationLayer*>(hit.layer);
+                if (!io.KeyCtrl) seq.clearKeySelections();
                 drag = Drag::PencilLane;
                 dragLayerId = al->id;
                 preEditJson = al->keysToJson();
@@ -2491,21 +2587,18 @@ void TimelineUI::body(Sequence& seq)
             if (!rubberAdd)
             {
                 Selection::get().clear();
-                for (auto& l : seq.layers)
-                {
-                    if (auto* al = dynamic_cast<AutomationLayer*>(l.get())) al->selectedKeys.clear();
-                    else if (auto* gl = dynamic_cast<GradientLayer*>(l.get())) gl->selectedKeys.clear();
-                    else if (auto* tl = dynamic_cast<TriggerLayer*>(l.get())) tl->selectedKeys.clear();
-                    if (auto* cl2 = dynamic_cast<ClipLayer*>(l.get()))
-                        for (auto& c : cl2->clips)
-                            for (auto& a : c->automations) a->selectedKeys.clear();
-                }
+                seq.clearKeySelections();
             }
             break;
         }
         default:
         {
-            if (!io.KeyCtrl) Selection::get().clear();
+            // empty space (below the lanes, the corner): nothing stays selected
+            if (!io.KeyCtrl)
+            {
+                Selection::get().clear();
+                seq.clearKeySelections();
+            }
             drag = Drag::Rubber;
             rubberStart = mouse;
             rubberAdd = io.KeyCtrl;
@@ -2573,10 +2666,14 @@ void TimelineUI::body(Sequence& seq)
 
                 // blocks on one track never overlap in time (conflicting
                 // effects): clamp the common delta so every dragged clip
-                // lands flush against its neighbours instead of on top
+                // lands flush against its neighbours instead of on top.
+                // Reorder mode (host opt-in): a single clip moves FREELY —
+                // it may cross its neighbours and seats itself at the
+                // nearest legal spot on release.
+                const bool freeMove = reorderOnDrag && dragClips.size() == 1;
                 std::vector<uint64_t> draggedIds;
                 for (auto& r : dragClips) draggedIds.push_back(r.clip);
-                for (auto& r : dragClips)
+                if (!freeMove) for (auto& r : dragClips)
                 {
                     ClipLayer* owner = nullptr;
                     Clip* c = seq.findClip(r.clip, &owner);
@@ -2634,7 +2731,8 @@ void TimelineUI::body(Sequence& seq)
                 // creates a fresh layer for it — no way otherwise to stack
                 // a second effect under the first without pre-creating the
                 // track by hand
-                dragBelowLanes = !tg && mouse.y >= flowBottom - LANE_GAP &&
+                dragBelowLanes = offerClipLayers && !tg &&
+                                 mouse.y >= flowBottom - LANE_GAP &&
                                  mouse.x > cLaneX0;
                 break;
             }
@@ -3072,6 +3170,22 @@ void TimelineUI::body(Sequence& seq)
                         }
                     }
 
+                    // reorder mode: the freely-dragged clip seats at the
+                    // nearest legal spot NOW — before or after the
+                    // neighbour it crossed (recs below carry the seat, so
+                    // undo/redo restore it exactly)
+                    if (reorderOnDrag && dragClips.size() == 1)
+                        for (auto& r : dragClips)
+                        {
+                            ClipLayer* owner = nullptr;
+                            Clip* c = seq.findClip(r.clip, &owner);
+                            if (c && owner)
+                                c->startP->setValue(
+                                    (float)owner->resolveOverlap(
+                                        c->start(), c->length(), { c->id }),
+                                    false);
+                        }
+
                     struct MoveRec { uint64_t clip, oldLayer, newLayer; double oldStart, newStart; };
                     std::vector<MoveRec> recs;
                     for (auto& r : dragClips)
@@ -3243,60 +3357,100 @@ void TimelineUI::body(Sequence& seq)
         const LaneGeom* g = hit.layer ? laneAtY(mouse.y) : nullptr;
         ctxValue = g ? yToNorm(*g, mouse.y) : 0.f;
 
+        // the menus act on the selection, so a right-click follows the same
+        // one-selection rule as a left click: an unselected key becomes THE
+        // key selection (its clip / layer selected as context), anything that
+        // is not a key drops every key selection — the block menu's Delete
+        // must reach the block, never a key the user forgot about elsewhere
+        const bool exclusive = !io.KeyCtrl;
         switch (hit.kind)
         {
         case Hit::ClipBody: case Hit::ClipL: case Hit::ClipR:
             ctxItemId = hit.clip->id;
+            if (exclusive) seq.clearKeySelections();
             if (!hit.clip->isSelected()) Selection::get().set(hit.clip);
             ImGui::OpenPopup("clip_ctx");
             break;
         case Hit::CAKey:
-            ctxItemId = hit.keyId;
-            ctxClipId = hit.clip->id;
-            ctxAutoId = hit.cauto->id;
-            ImGui::OpenPopup("cakey_ctx");
-            break;
         case Hit::CAGKey:
             ctxItemId = hit.keyId;
             ctxClipId = hit.clip->id;
             ctxAutoId = hit.cauto->id;
-            preEditJson = hit.cauto->keysToJson();
-            ImGui::OpenPopup("cagkey_ctx");
+            if (!hit.cauto->selectedKeys.count(hit.keyId))
+            {
+                if (exclusive) seq.clearKeySelections();
+                hit.cauto->selectedKeys.insert(hit.keyId);
+                hit.clip->select();
+            }
+            if (hit.kind == Hit::CAGKey) preEditJson = hit.cauto->keysToJson();
+            ImGui::OpenPopup(hit.kind == Hit::CAKey ? "cakey_ctx" : "cagkey_ctx");
             break;
         case Hit::CAHeader: case Hit::CAArm: case Hit::CACurve: case Hit::CAGrad:
             ctxClipId = hit.clip->id;
             ctxAutoId = hit.cauto->id;
             ctxItemId = hit.clip->id;
+            if (exclusive) seq.clearKeySelections();
             ImGui::OpenPopup("carow_ctx");
             break;
         case Hit::AASection:
             ctxClipId = hit.clip->id;
             ctxAaRow = hit.aaRow;
             ctxAaSection = hit.aaSection;
+            if (exclusive) seq.clearKeySelections();
             ImGui::OpenPopup("aasection_ctx");
             break;
         case Hit::AKey:
+        {
             ctxItemId = hit.keyId;
+            auto* al = static_cast<AutomationLayer*>(hit.layer);
+            if (!al->selectedKeys.count(hit.keyId))
+            {
+                if (exclusive) seq.clearKeySelections();
+                al->selectedKeys.insert(hit.keyId);
+                al->select();
+            }
             ImGui::OpenPopup("akey_ctx");
             break;
+        }
         case Hit::GKey:
+        {
             ctxItemId = hit.keyId;
-            preEditJson = static_cast<GradientLayer*>(hit.layer)->keysToJson();
+            auto* gl = static_cast<GradientLayer*>(hit.layer);
+            if (!gl->selectedKeys.count(hit.keyId))
+            {
+                if (exclusive) seq.clearKeySelections();
+                gl->selectedKeys.insert(hit.keyId);
+                gl->select();
+            }
+            preEditJson = gl->keysToJson();
             ImGui::OpenPopup("gkey_ctx");
             break;
+        }
         case Hit::TKey:
+        {
             ctxItemId = hit.keyId;
+            auto* tl = static_cast<TriggerLayer*>(hit.layer);
+            if (!tl->selectedKeys.count(hit.keyId))
+            {
+                if (exclusive) seq.clearKeySelections();
+                tl->selectedKeys.insert(hit.keyId);
+                tl->select();
+            }
             ImGui::OpenPopup("tkey_ctx");
             break;
+        }
         case Hit::Lane:
+            if (exclusive) seq.clearKeySelections();
             ImGui::OpenPopup("lane_ctx");
             break;
         case Hit::Header:
         case Hit::HeaderGrip:
+            if (exclusive) seq.clearKeySelections();
             hit.layer->select();
             ImGui::OpenPopup("layer_ctx");
             break;
         default:
+            if (exclusive) seq.clearKeySelections();
             ImGui::OpenPopup("empty_ctx");
             break;
         }
@@ -4501,6 +4655,10 @@ void TimelineUI::body(Sequence& seq)
             {
                 MediaPayload mp;
                 memcpy(&mp, pl->Data, sizeof(mp));
+                // host filter: payloads outside this surface's vocabulary
+                // are ignored entirely (no preview, no clip, no new lane)
+                if (!acceptMedia || acceptMedia(mp))
+                {
                 double t = snapTime(seq, xToTime(mouse.x), io.KeyAlt);
                 double len = mp.duration > 0 ? mp.duration : 2.0;
                 ImVec4 gcol(mp.color[0], mp.color[1], mp.color[2], 0.55f);
@@ -4513,6 +4671,21 @@ void TimelineUI::body(Sequence& seq)
                     target = nullptr;
                     g = nullptr;
                 }
+                // single-track surfaces (clip-layer creation off): a drop
+                // outside every lane lands on the FIRST clip lane instead
+                // of growing a new one (the first-ever drop still creates
+                // the initial track through the seat below)
+                if (!target && !offerClipLayers)
+                    for (auto& lg : geoms)
+                    {
+                        if (lg.layer->id == stickyLayerId) continue;
+                        if (auto* cl2 = dynamic_cast<ClipLayer*>(lg.layer))
+                        {
+                            target = cl2;
+                            g = &lg;
+                            break;
+                        }
+                    }
 
                 if (target)
                 {
@@ -4533,14 +4706,13 @@ void TimelineUI::body(Sequence& seq)
                     cdl->AddText(ImVec2(cLaneX0 + 8, gy + 4), IM_COL32(200, 200, 205, 200), "New layer");
                     if (pl->IsDelivery())
                     {
+                        // the seat's clip is the SAME clip a lane drop makes
+                        // (binding included) — only the undo record differs:
+                        // one composite layer add/remove, snapshotted AFTER
+                        // the clip is in so redo restores both together
                         auto* nl = static_cast<ClipLayer*>(seq.addLayer(Layer::LType::Clips,
                                                            mp.name[0] ? mp.name : "Clips"));
-                        Clip* c = nl->addClip(mp.kind == 1 ? Clip::CType::Audio : Clip::CType::Block,
-                                              mp.name[0] ? mp.name : "Clip", t, len);
-                        ImVec4 col(mp.color[0], mp.color[1], mp.color[2], mp.color[3]);
-                        c->colorP->setValue(col, false);
-                        c->colorP->defaultValue = col;
-                        if (mp.kind == 1 && mp.file[0]) c->setAudioFile(mp.file, mp.duration <= 0);
+                        Clip* c = clipFromMediaPayload(nl, t, mp);
                         json snap = nl->save();
                         int idx = seq.layerIndex(nl);
                         uint64_t nid = nl->id;
@@ -4548,9 +4720,10 @@ void TimelineUI::body(Sequence& seq)
                             [sp, snap, idx] { sp->addLayerFromJson(snap, idx); },
                             [sp, nid] { sp->removeLayer(nid); },
                             { sp });
-                        c->select();
+                        if (c) c->select();
                     }
                 }
+                } // acceptMedia
             }
         }
         ImGui::EndDragDropTarget();
@@ -4573,6 +4746,22 @@ void TimelineUI::body(Sequence& seq)
         if (ImGui::MenuItem("Copy", "Ctrl+C")) copySelection();
         if (ImGui::MenuItem("Duplicate", "Ctrl+D")) duplicateSelection();
         if (ImGui::MenuItem("Delete", "Del")) deleteSelection();
+        // the effect's automation as a whole (like Copy/Duplicate/Delete
+        // this acts on the selected blocks — the clicked one is selected):
+        // every row is emptied for redrawing, the rows themselves stay.
+        // Per row, the row's own menu offers "Clear Keys".
+        {
+            std::vector<Clip*> blocks;
+            bool anyKeys = false;
+            for (Clip* c : Selection::get().getAs<Clip>())
+            {
+                if (!c->layer || c->layer->sequence != sp || c->ctype != Clip::CType::Block) continue;
+                blocks.push_back(c);
+                if (c->hasAutomationKeys()) anyKeys = true;
+            }
+            if (ImGui::MenuItem("Clear Automation", nullptr, false, anyKeys))
+                clearClipAutomation(blocks);
+        }
         ImGui::Separator();
         if (ImGui::MenuItem("Select Layer"))
             if (Layer* l = seq.findLayer(ctxLayerId)) l->select();
@@ -4774,16 +4963,19 @@ void TimelineUI::body(Sequence& seq)
                 if (!a->recArm && a->recording) a->stopRecordingAndApply();
             }
             ImGui::Separator();
-            bool hasKeys = !a->keys.empty() || !a->gkeys.empty();
-            if (ImGui::MenuItem("Clear Keys", nullptr, false, hasKeys))
+            // this row's curve / gradient goes, the row stays (redraw it)
+            if (ImGui::MenuItem("Clear Keys", nullptr, false, a->hasKeys()))
             {
                 json pre = a->keysToJson();
-                a->keys.clear();
-                a->gkeys.clear();
-                a->selectedKeys.clear();
+                a->clearKeys();
                 pushClipAutoKeysEdit(sp, ctxClipId, ctxAutoId, pre, a->keysToJson(),
                                      "Clear Keys");
             }
+            // ... and the same for EVERY row of this block — the effect's
+            // automation as a whole, so it can be redrawn from scratch
+            // without visiting each row (also on the block's own menu)
+            if (ImGui::MenuItem("Clear Block Automation", nullptr, false, c->hasAutomationKeys()))
+                clearClipAutomation({ c });
             if (ImGui::MenuItem("Remove Automation"))
             {
                 // host-derived rows: let the app clear whatever owns the
@@ -4911,7 +5103,7 @@ void TimelineUI::body(Sequence& seq)
                 json pre = al->keysToJson();
                 float mn = al->rangeMinP->floatValue(), mx = al->rangeMaxP->floatValue();
                 AutoKey* k = al->addKey(ctxTime, mn + std::max(0.f, std::min(1.f, ctxValue)) * (mx - mn));
-                al->selectedKeys.clear();
+                seq.clearKeySelections(); // the new key is THE selection
                 al->selectedKeys.insert(k->id);
                 al->select();
                 pushKeysEdit(sp, al->id, pre, al->keysToJson(), "Add Key");
@@ -4926,7 +5118,7 @@ void TimelineUI::body(Sequence& seq)
             {
                 json pre = gl->keysToJson();
                 GradKey* k = gl->addKey(ctxTime, gl->colorAt(ctxTime));
-                gl->selectedKeys.clear();
+                seq.clearKeySelections();
                 gl->selectedKeys.insert(k->id);
                 gl->select();
                 pushKeysEdit(sp, gl->id, pre, gl->keysToJson(), "Add Color Key");
@@ -4938,7 +5130,7 @@ void TimelineUI::body(Sequence& seq)
             {
                 json pre = tl->keysToJson();
                 TimeTrigger* t = tl->addTrigger(ctxTime);
-                tl->selectedKeys.clear();
+                seq.clearKeySelections();
                 tl->selectedKeys.insert(t->id);
                 tl->select();
                 pushKeysEdit(sp, tl->id, pre, tl->keysToJson(), "Add Trigger");

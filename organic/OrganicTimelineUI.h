@@ -61,6 +61,15 @@ public:
     bool  offerClipLayers = true;
     bool  offerAutomationLayers = true;
     bool  offerGradientLayers = true;
+
+    // Reorder-on-drag (host opt-in): a SINGLE dragged clip moves freely and
+    // seats itself at the nearest legal spot on RELEASE (resolveOverlap —
+    // before OR after its neighbours), instead of being clamped flush
+    // against them mid-drag. Hosts with one-track surfaces (lightshow's
+    // 24 h master Timeline) need it: with the clamp, the only way to move
+    // a block across its neighbour was a detour over a second track.
+    // Multi-clip drags keep the clamp (relative order stays intact).
+    bool  reorderOnDrag = false;
     bool  offerTriggerLayers = true;
     // Layer renaming (double-click the header / context "Rename Layer").
     // Hosts that auto-name their layers turn it off.
@@ -75,6 +84,24 @@ public:
     // Host hook: a Block clip was double-clicked — open/edit the thing it
     // references (lightshow: the effect graph in the Node Graph panel).
     std::function<void(Clip&)> clipDoubleClicked;
+
+    // Host hook: media-drop filter. Return false to REFUSE a dragged
+    // MediaPayload — the drop target ignores it entirely (no preview, no
+    // clip, no new lane). Hosts with several timeline surfaces use it to
+    // keep each one's vocabulary (lightshow: the Clip Editor takes effects
+    // + audio, the 24 h Timeline takes only clip payloads). Unset = accept
+    // everything (default organic behaviour).
+    std::function<bool(const MediaPayload&)> acceptMedia;
+
+    // The MODEL half of a media drop: the clip a MediaPayload becomes on
+    // `cl` at `t` (the caller resolves overlap and owns undo/selection).
+    // Every field the payload carries lands here — name, color, the audio
+    // file of an audio payload, and the opaque `file` URI as a Block
+    // clip's hostBinding. Both drop seats (an existing lane and the
+    // "New layer" strip below the lanes) build their clip through this one
+    // function, so a payload can never bind on one seat and not the other.
+    // Returns nullptr only for a null layer.
+    static Clip* clipFromMediaPayload(ClipLayer* cl, double t, const MediaPayload& mp);
 
     // Host hook: 3D waveform. When set, an audio clip's waveform band asks
     // the host for a TEXTURE of the visible media window [mediaT0, mediaT1]
@@ -119,6 +146,13 @@ public:
     const char* zoomOneLabel = "1:1";
     const char* zoomInLabel  = "+";
     const char* zoomFitLabel = "Fit";
+
+    // Zoom floor, pixels per second (host-settable). The 2.0 default suits
+    // song-length sequences; a DAY-length surface (lightshow's 24 h master
+    // Timeline: 86400 s ≈ 0.02 px/s to fit a screen) needs to zoom far
+    // beyond it — the ruler/snap step loops double until legible at any
+    // scale, so only this clamp stood in the way.
+    double minPps = 2.0;
 
 private:
     // interaction state

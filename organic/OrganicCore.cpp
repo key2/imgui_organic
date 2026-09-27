@@ -35,6 +35,12 @@ std::string formatTime(double seconds, bool withMs)
     int ms   = (int)std::round((seconds - total) * 1000.0);
     if (ms >= 1000) { ms = 0; secs++; if (secs >= 60) { secs = 0; mins++; } }
     char buf[64];
+    if (mins >= 60) // hour scale (day-length sequences): h:mm:ss[.ms]
+    {
+        if (withMs) snprintf(buf, sizeof(buf), "%d:%02d:%02d.%03d", mins / 60, mins % 60, secs, ms);
+        else        snprintf(buf, sizeof(buf), "%d:%02d:%02d", mins / 60, mins % 60, secs);
+        return buf;
+    }
     if (withMs) snprintf(buf, sizeof(buf), "%d:%02d.%03d", mins, secs, ms);
     else        snprintf(buf, sizeof(buf), "%d:%02d", mins, secs);
     return buf;

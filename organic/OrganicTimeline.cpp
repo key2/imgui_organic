@@ -369,6 +369,23 @@ void ClipAutomation::clampToClip()
                 gkeys.end());
 }
 
+bool ClipAutomation::clearKeys()
+{
+    const bool had = hasKeys();
+    keys.clear();
+    gkeys.clear();
+    selectedKeys.clear();
+    // a take in flight would re-populate the swept span when it stops —
+    // the user asked for an empty row, so the pending points go with the
+    // keys. The arm state is the user's and stays: an armed row simply
+    // starts a fresh take from here on.
+    recording = false;
+    recPoints.clear();
+    latchStart = -1;
+    latch[0] = -9;
+    return had;
+}
+
 void ClipAutomation::applyDrawnPoints(const std::vector<std::pair<double, float>>& pts,
                                       int method, float tol)
 {
@@ -540,6 +557,19 @@ void Clip::clampAutomations()
     for (auto& a : automations) a->clampToClip();
 }
 
+bool Clip::hasAutomationKeys() const
+{
+    for (auto& a : automations) if (a->hasKeys()) return true;
+    return false;
+}
+
+size_t Clip::clearAutomationKeys()
+{
+    size_t cleared = 0;
+    for (auto& a : automations) if (a->clearKeys()) cleared++;
+    return cleared;
+}
+
 void Clip::onParamChanged(Parameter* p)
 {
     if (p == startP && p->floatValue() < 0) p->setValue(0.f, false);
@@ -572,6 +602,7 @@ json Clip::save() const
     json j = Container::save();
     j["id"]    = id;
     j["ctype"] = ctype == CType::Audio ? "audio" : "block";
+    if (!hostBinding.empty()) j["hostBinding"] = hostBinding;
     if (!automations.empty())
     {
         json arr = json::array();
@@ -590,6 +621,7 @@ void Clip::load(const json& j)
 {
     Container::load(j);
     if (j.contains("id")) id = j["id"].get<uint64_t>();
+    hostBinding = j.value("hostBinding", "");
     if (j.contains("structExp") && j["structExp"].is_array() && j["structExp"].size() >= 2)
     {
         structExpanded[0] = j["structExp"][0].get<bool>();
@@ -676,13 +708,27 @@ Clip* ClipLayer::addClip(Clip::CType type, const std::string& name, double t, do
     return raw;
 }
 
-Clip* ClipLayer::addClipFromJson(const json& j)
+Clip* ClipLayer::addClipFromJson(const json& j, bool newIds)
 {
     Clip::CType t = (j.value("ctype", "block") == std::string("audio")) ? Clip::CType::Audio : Clip::CType::Block;
     auto c = std::make_unique<Clip>(this, t, j.value("niceName", "Clip"));
     Clip* raw = c.get();
     clips.push_back(std::move(c));
-    raw->load(j);
+    if (newIds)
+    {
+        json data = j;
+        data["id"] = sequence->newId();
+        // A paste into another sequence can have the same local ID cursor.
+        if (data["id"] == j.value("id", uint64_t(0))) data["id"] = sequence->newId();
+        if (data.contains("autos")) for (auto& row : data["autos"])
+        {
+            row["id"] = sequence->newId();
+            if (row.contains("keys")) for (auto& key : row["keys"])
+                key["id"] = sequence->newId();
+        }
+        raw->load(data);
+    }
+    else raw->load(j);
     if (raw->id == 0) raw->id = sequence->newId();
     sequence->nextId = std::max(sequence->nextId, raw->id + 1);
     sortClips();
@@ -1414,6 +1460,38 @@ Clip* Sequence::findClip(uint64_t cid, ClipLayer** outLayer) const
     return nullptr;
 }
 
+bool Sequence::anyKeySelected() const
+{
+    for (auto& l : layers)
+    {
+        if (auto* al = dynamic_cast<AutomationLayer*>(l.get())) { if (!al->selectedKeys.empty()) return true; }
+        else if (auto* gl = dynamic_cast<GradientLayer*>(l.get())) { if (!gl->selectedKeys.empty()) return true; }
+        else if (auto* tl = dynamic_cast<TriggerLayer*>(l.get())) { if (!tl->selectedKeys.empty()) return true; }
+        else if (auto* cl = dynamic_cast<ClipLayer*>(l.get()))
+        {
+            for (auto& c : cl->clips)
+                for (auto& a : c->automations)
+                    if (!a->selectedKeys.empty()) return true;
+        }
+    }
+    return false;
+}
+
+void Sequence::clearKeySelections()
+{
+    for (auto& l : layers)
+    {
+        if (auto* al = dynamic_cast<AutomationLayer*>(l.get())) al->selectedKeys.clear();
+        else if (auto* gl = dynamic_cast<GradientLayer*>(l.get())) gl->selectedKeys.clear();
+        else if (auto* tl = dynamic_cast<TriggerLayer*>(l.get())) tl->selectedKeys.clear();
+        else if (auto* cl = dynamic_cast<ClipLayer*>(l.get()))
+        {
+            for (auto& c : cl->clips)
+                for (auto& a : c->automations) a->selectedKeys.clear();
+        }
+    }
+}
+
 int AudioAnalysisView::sectionAt(const std::vector<Section>& v, double t)
 {
     for (int i = (int)v.size() - 1; i >= 0; i--)
@@ -1431,10 +1509,26 @@ Clip* Sequence::analysisAudioClip() const
     return nullptr;
 }
 
+void Sequence::play()
+{
+    if (playing) return;
+    playing = true;
+    ++transportRevision;
+}
+
+void Sequence::pause()
+{
+    if (!playing) return;
+    playing = false;
+    ++transportRevision;
+    ++stopRevision;
+}
+
 void Sequence::stop()
 {
     playing = false;
     direction = 1;
+    ++stopRevision;
     setTime(0);
     for (auto& l : layers)
     {
@@ -1447,8 +1541,9 @@ void Sequence::stop()
     }
 }
 
-void Sequence::setTime(double t)
+void Sequence::setTime(double t, bool isSeek)
 {
+    if (isSeek) ++transportRevision;
     currentTime = std::max(0.0, std::min((double)totalTime(), t));
     for (auto& l : layers)
         if (auto* tl = dynamic_cast<TriggerLayer*>(l.get()))
@@ -1492,9 +1587,10 @@ void Sequence::update(double dt)
     {
         switch (mode)
         {
-        case 0: currentTime = hi; playing = false; break;                 // once
+        case 0: currentTime = hi; pause(); break;                        // once
         case 1:                                                            // loop
             currentTime = lo + std::fmod(currentTime - lo, std::max(0.001, hi - lo));
+            ++transportRevision;
             wrapped = true;
             break;
         case 2:                                                            // ping-pong
@@ -1851,6 +1947,7 @@ void Sequence::load(const json& j)
     currentTime = 0;
     playing = false;
     direction = 1;
+    ++transportRevision;
 }
 
 // ================================================================ SequenceManager

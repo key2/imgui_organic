@@ -111,6 +111,14 @@ public:
     void sortKeys();
     // drop keys outside 0..clip length (after resize gestures)
     void clampToClip();
+    // the row carries a curve / gradient (any key of either kind)
+    bool hasKeys() const { return !keys.empty() || !gkeys.empty(); }
+    // wipe the row's content so it can be redrawn: every key (both kinds),
+    // the key selection and a pending recording take go. Everything that
+    // makes the row what it is stays — identity, name, target, range, arm
+    // state and expansion — so the host sees the same row, now empty.
+    // Returns whether a key was removed (the undo-worthy part).
+    bool clearKeys();
 
     // pencil mode / scalar recording: replace the swept range with keys
     // simplified from a point cloud (clip-local times)
@@ -217,6 +225,9 @@ public:
     uint64_t   id = 0;
     ClipLayer* layer = nullptr;
     CType      ctype = CType::Block;
+    // Opaque host resource URI, separate from the displayed name. Travels
+    // with save/load, clipboard copies, splits and undo snapshots.
+    std::string hostBinding;
 
     Parameter* startP  = nullptr; // seconds
     Parameter* lengthP = nullptr; // seconds
@@ -255,6 +266,13 @@ public:
     ClipAutomation* findAutomationByTarget(const std::string& target) const;
     json removeAutomation(uint64_t id); // returns saved data
     void clampAutomations();            // keys outside 0..length are dropped
+    // any row of the block carries a key
+    bool hasAutomationKeys() const;
+    // clear the block's automation as a whole — every row's keys go
+    // (ClipAutomation::clearKeys), the rows themselves stay: the block
+    // keeps its automation layout and can be redrawn row by row. Returns
+    // the number of rows that lost keys.
+    size_t clearAutomationKeys();
 
     void setAudioFile(const std::string& path, bool adjustLength = false);
 
@@ -298,7 +316,8 @@ public:
     std::vector<std::unique_ptr<Clip>> clips;
 
     Clip* addClip(Clip::CType type, const std::string& name, double t, double len);
-    Clip* addClipFromJson(const json& j);         // restores id too
+    // Restore IDs for undo/load; copies mint new block, automation and key IDs.
+    Clip* addClipFromJson(const json& j, bool newIds = false);
     json  removeClip(uint64_t id);                // returns saved data
     Clip* findClip(uint64_t id) const;
     void  sortClips();
@@ -452,6 +471,10 @@ public:
     double currentTime = 0;
     bool   playing     = false;
     int    direction   = 1;   // ping-pong direction
+    // Runtime-only event counters: a same-time seek or stop/play between
+    // host updates must not disappear into an unchanged transport snapshot.
+    uint64_t transportRevision = 0;
+    uint64_t stopRevision = 0;
 
     // loop range (in/out points); loopIn < 0 = whole sequence
     double loopIn = -1, loopOut = -1;
@@ -477,6 +500,14 @@ public:
 
     Clip* findClip(uint64_t id, ClipLayer** outLayer = nullptr) const;
 
+    // Key selection lives beside the clip Selection, in per-row sets
+    // (embedded automations of every block) and per-layer sets (classic
+    // automation / gradient / trigger lanes). The editor keeps ONE selection
+    // at a time: a plain click on anything else drops every key selection,
+    // so a later Delete can only reach what the user last picked.
+    bool anyKeySelected() const;     // any key selected in any row / lane
+    void clearKeySelections();       // drop them all (rows and lanes)
+
     // the audio clip whose host-fed analysis drives the tracked beat grid
     // and the toolbar BPM chip: the first audio clip carrying data (layer
     // order — the pinned audio lane wins in practice). null when none.
@@ -497,11 +528,13 @@ public:
     json contentToJson() const;
     void contentFromJson(const json& j);
 
-    void play()  { playing = true; }
-    void pause() { playing = false; }
+    void play();
+    void pause();
     void stop();
-    void togglePlay() { playing = !playing; }
-    void setTime(double t);
+    void togglePlay() { if (playing) pause(); else play(); }
+    // Clock-follow corrections are not explicit seeks; all UI/API seeks use
+    // the default, including seeks to the current time.
+    void setTime(double t, bool isSeek = true);
     void update(double dt);
 
     std::string inspectableTypeName() const override { return "Sequence"; }
