@@ -108,6 +108,20 @@ public:
     PType       type;
     std::string niceName, shortName, description;
 
+    // Optional localized display overrides. These never affect shortName / serialization (the JSON
+    // key stays derived from the English niceName), so translating the UI does not break save files.
+    // Empty means "fall back to the English niceName / enumOptions / description".
+    std::string displayName;
+    std::string displayDescription;
+    std::vector<std::string> enumLabels;
+    const std::string& label()     const { return displayName.empty() ? niceName : displayName; }
+    const std::string& tooltip()   const { return displayDescription.empty() ? description : displayDescription; }
+    const std::string& enumLabel(int i) const
+    {
+        if (i >= 0 && i < (int)enumLabels.size() && !enumLabels[i].empty()) return enumLabels[i];
+        return enumOptions[i];
+    }
+
     Value value, defaultValue;
 
     bool  hasRange = false;

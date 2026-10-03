@@ -110,13 +110,17 @@ void DockManager::gui()
 
 void DockManager::panelsMenu(const std::function<void()>& extra)
 {
-    if (ImGui::BeginMenu("Panels"))
+    if (ImGui::BeginMenu(translate("Panels")))
     {
         for (auto& p : panels)
-            ImGui::MenuItem(p.name.c_str(), nullptr, &p.open);
+        {
+            // "<translated>###<name>" keeps the MenuItem's ID stable across languages.
+            std::string label = std::string(translate(p.name.c_str())) + "###" + p.name;
+            ImGui::MenuItem(label.c_str(), nullptr, &p.open);
+        }
         if (extra) extra(); // app-specific entries (e.g. lightshow's NDI submenu)
         ImGui::Separator();
-        if (ImGui::MenuItem("Open All"))
+        if (ImGui::MenuItem(translate("Open All")))
             for (auto& p : panels) p.open = true;
         ImGui::EndMenu();
     }
@@ -124,10 +128,10 @@ void DockManager::panelsMenu(const std::function<void()>& extra)
 
 void DockManager::viewMenu()
 {
-    if (ImGui::BeginMenu("View"))
+    if (ImGui::BeginMenu(translate("View")))
     {
-        if (ImGui::MenuItem("Reset Layout")) requestReset();
-        if (ImGui::MenuItem("Save Layout As...")) wantSaveLayoutPopup = true;
+        if (ImGui::MenuItem(translate("Reset Layout"))) requestReset();
+        if (ImGui::MenuItem(translate("Save Layout As..."))) wantSaveLayoutPopup = true;
         auto layouts = listLayouts();
         if (!layouts.empty())
         {
@@ -140,7 +144,7 @@ void DockManager::viewMenu()
                     requestLoadLayout(l);
                 n++;
             }
-            if (ImGui::BeginMenu("Delete Layout"))
+            if (ImGui::BeginMenu(translate("Delete Layout")))
             {
                 for (auto& l : layouts)
                     if (ImGui::MenuItem(l.c_str()))
@@ -156,19 +160,20 @@ void DockManager::popupsGui()
 {
     if (wantSaveLayoutPopup)
     {
-        ImGui::OpenPopup("Save Layout As");
+        ImGui::OpenPopup("###SaveLayoutAs");
         wantSaveLayoutPopup = false;
     }
-    if (ImGui::BeginPopupModal("Save Layout As", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+    if (ImGui::BeginPopupModal((std::string(translate("Save Layout As")) + "###SaveLayoutAs").c_str(),
+                               nullptr, ImGuiWindowFlags_AlwaysAutoResize))
     {
-        ImGui::InputText("Name", layoutNameBuf, sizeof(layoutNameBuf));
-        if (ImGui::Button("Save", ImVec2(120, 0)))
+        ImGui::InputText(translate("Name"), layoutNameBuf, sizeof(layoutNameBuf));
+        if (ImGui::Button(translate("Save"), ImVec2(120, 0)))
         {
             if (layoutNameBuf[0]) saveLayoutToFile(layoutNameBuf);
             ImGui::CloseCurrentPopup();
         }
         ImGui::SameLine();
-        if (ImGui::Button("Cancel", ImVec2(120, 0))) ImGui::CloseCurrentPopup();
+        if (ImGui::Button(translate("Cancel"), ImVec2(120, 0))) ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }
 }

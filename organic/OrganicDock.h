@@ -44,6 +44,12 @@ public:
     // Ctrl+1..9 layout shortcuts (call once per frame).
     void shortcuts();
 
+    // Optional UI translator. An app may set this to localize the dock's own menu labels and panel
+    // titles; it maps a stable English key to a displayed string. Defaults to identity (English).
+    // Panel titles are shown as "<translated>###<name>" so the ImGui window identity (and saved
+    // layouts, which key off <name>) stay stable across languages.
+    std::function<const char*(const char*)> translate = [](const char* s) { return s; };
+
     void requestReset() { resetRequested = true; }
     void saveLayoutToFile(const std::string& name);
     void requestLoadLayout(const std::string& name);

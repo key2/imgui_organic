@@ -87,7 +87,7 @@ static bool drawParamWidgetEx(Parameter& p, const std::vector<Parameter*>& targe
 {
     ImGui::PushID(&p);
     bool changed = false;
-    const char* label = p.niceName.c_str();
+    const char* label = p.label().c_str();
     if (p.readOnly) ImGui::BeginDisabled();
 
     float w = std::max(120.f, ImGui::GetContentRegionAvail().x * 0.55f);
@@ -157,7 +157,7 @@ static bool drawParamWidgetEx(Parameter& p, const std::vector<Parameter*>& targe
     {
         int v = p.intValue();
         std::vector<const char*> opts;
-        for (auto& o : p.enumOptions) opts.push_back(o.c_str());
+        for (int oi = 0; oi < (int)p.enumOptions.size(); oi++) opts.push_back(p.enumLabel(oi).c_str());
         ImGui::SetNextItemWidth(w);
         if (!opts.empty() && ImGui::Combo(label, &v, opts.data(), (int)opts.size()))
         {
@@ -206,7 +206,7 @@ static bool drawParamWidgetEx(Parameter& p, const std::vector<Parameter*>& targe
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
     {
         ImGui::BeginTooltip();
-        if (!p.description.empty()) ImGui::TextUnformatted(p.description.c_str());
+        if (!p.tooltip().empty()) ImGui::TextUnformatted(p.tooltip().c_str());
         ImGui::TextDisabled("%s  [%s]%s%s", p.controlAddress().c_str(), ptypeName(p.type),
                             p.isOverriden() ? "  (edited)" : "",
                             targets.size() > 1 ? "  (multi)" : "");
