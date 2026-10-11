@@ -585,7 +585,11 @@ void Clip::onParamChanged(Parameter* p)
 
 void Clip::inspectorGui()
 {
+    if (locked)
+        ImGui::TextDisabled("Host-managed block — timing is owned by the app");
+    if (locked) ImGui::BeginDisabled();
     Container::inspectorGui();
+    if (locked) ImGui::EndDisabled();
     if (ctype == CType::Audio)
     {
         if (asset)
@@ -603,6 +607,7 @@ json Clip::save() const
     j["id"]    = id;
     j["ctype"] = ctype == CType::Audio ? "audio" : "block";
     if (!hostBinding.empty()) j["hostBinding"] = hostBinding;
+    if (locked) j["locked"] = true;
     if (!automations.empty())
     {
         json arr = json::array();
@@ -622,6 +627,7 @@ void Clip::load(const json& j)
     Container::load(j);
     if (j.contains("id")) id = j["id"].get<uint64_t>();
     hostBinding = j.value("hostBinding", "");
+    locked = j.value("locked", false);
     if (j.contains("structExp") && j["structExp"].is_array() && j["structExp"].size() >= 2)
     {
         structExpanded[0] = j["structExp"][0].get<bool>();
@@ -680,6 +686,7 @@ json Layer::save() const
     j["id"]     = id;
     j["ltype"]  = (int)ltype;
     j["height"] = uiHeight;
+    if (locked) j["locked"] = true;
     return j;
 }
 
@@ -688,6 +695,7 @@ void Layer::load(const json& j)
     Container::load(j);
     if (j.contains("id"))     id = j["id"].get<uint64_t>();
     if (j.contains("height")) uiHeight = j["height"].get<float>();
+    locked = j.value("locked", false);
 }
 
 // ================================================================ ClipLayer

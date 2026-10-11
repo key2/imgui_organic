@@ -77,6 +77,36 @@ static void testSequenceStructure()
     CHECK(seq2.findClip(cid) != nullptr);
 }
 
+static void testLockedFlags()
+{
+    // host-managed layers/blocks: `locked` persists with the model (the
+    // editor consults it to refuse move/resize/split/copy/delete/drops;
+    // those gates are UI-side and exercised by hand / by the host's tests)
+    Sequence seq("Seq");
+    auto* ll = static_cast<ClipLayer*>(seq.addLayer(Layer::LType::Clips, "Host"));
+    ll->locked = true;
+    Clip* c = ll->addClip(Clip::CType::Block, "HostBlock", 0.0, 8.0);
+    c->locked = true;
+    c->hostBinding = "widgets://global";
+    auto* plain = static_cast<ClipLayer*>(seq.addLayer(Layer::LType::Clips, "Free"));
+    Clip* f = plain->addClip(Clip::CType::Block, "FreeBlock", 0.0, 2.0);
+    CHECK(!plain->locked && !f->locked); // default stays false
+
+    json snap = seq.save();
+    Sequence seq2("Seq2");
+    seq2.load(snap);
+    auto* ll2 = seq2.findLayer(ll->id);
+    CHECK(ll2 && ll2->locked);
+    ClipLayer* owner = nullptr;
+    Clip* c2 = seq2.findClip(c->id, &owner);
+    CHECK(c2 && c2->locked && c2->hostBinding == "widgets://global");
+    Clip* f2 = seq2.findClip(f->id);
+    CHECK(f2 && !f2->locked);
+    // a copy that remints IDs keeps the flag (clipboard path)
+    Clip* copy = plain->addClipFromJson(c->save(), true);
+    CHECK(copy && copy->locked && copy->id != c->id);
+}
+
 static void testAutomation()
 {
     Sequence seq("Seq");
@@ -508,6 +538,7 @@ int main()
     testCoreParams();
     testSelectionScopes();
     testSequenceStructure();
+    testLockedFlags();
     testClipAutomations();
     testClipOverlapRules();
     testKeySelections();

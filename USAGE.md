@@ -536,6 +536,22 @@ re-populate the row when it stops). Programmatically:
 (*Remove Automation* → `Clip::removeAutomation`, or the host's
 `removeAutomationHook`).
 
+#### Host-managed (locked) layers and blocks
+
+A host that DERIVES a lane from external state — e.g. one full-length block
+whose rows mirror an app's global widgets — sets `Layer::locked` and
+`Clip::locked` (both persist). The editor then refuses everything that would
+change the lane's existence or geometry while keeping the automation fully
+editable: a locked block cannot be moved, resized, split, copied, duplicated
+or deleted (shortcuts, menus, rubber band and Ctrl+A skip it; its Inspector
+timing is read-only); a locked layer cannot be reordered, renamed, duplicated
+or deleted, takes no media drops, pastes or new clips, and no clip can be
+dragged onto it. The layer's *Enabled* mute stays available. Rows of a locked
+block hide *Remove Automation* (the host's reconciliation owns the row set);
+*Clear Keys* / *Clear Block Automation*, key editing, pencil and recording
+all work as usual. The host owns creation, naming, position and geometry and
+should re-assert them in its per-frame reconciliation.
+
 ### 3.6 Drag & drop media
 
 Any ImGui drag source can create clips by carrying a `MediaPayload`:

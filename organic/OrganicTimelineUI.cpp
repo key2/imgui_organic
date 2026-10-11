@@ -1655,12 +1655,13 @@ void TimelineUI::body(Sequence& seq)
             }
         }
 
-        // no key selected anywhere: the selected clips die whole
+        // no key selected anywhere: the selected clips die whole (host-
+        // managed locked blocks never do — only their keys above can)
         struct ClipRec { uint64_t layer; json data; };
         std::vector<ClipRec> clipRecs;
         if (caRecs.empty() && keyRecs.empty())
             for (Clip* c : Selection::get().getAs<Clip>())
-                if (c->layer && c->layer->sequence == sp)
+                if (c->layer && c->layer->sequence == sp && !c->locked && !c->layer->locked)
                     clipRecs.push_back({ c->layer->id, c->save() });
         for (auto& r : clipRecs)
             if (auto* cl = dynamic_cast<ClipLayer*>(seq.findLayer(r.layer)))
@@ -1744,7 +1745,9 @@ void TimelineUI::body(Sequence& seq)
     {
         auto clips = Selection::get().getAs<Clip>();
         std::vector<Clip*> mine;
-        for (Clip* c : clips) if (c->layer && c->layer->sequence == sp) mine.push_back(c);
+        for (Clip* c : clips)
+            if (c->layer && c->layer->sequence == sp && !c->locked && !c->layer->locked)
+                mine.push_back(c);
         if (mine.empty()) return;
         struct Rec { uint64_t layer; json data; };
         std::vector<Rec> recs;
@@ -1781,7 +1784,8 @@ void TimelineUI::body(Sequence& seq)
         seq.clearKeySelections(); // "all CLIPS": Delete must then reach the clips
         for (auto& l : seq.layers)
             if (auto* cl = dynamic_cast<ClipLayer*>(l.get()))
-                for (auto& c : cl->clips) Selection::get().add(c.get());
+                for (auto& c : cl->clips)
+                    if (!c->locked && !cl->locked) Selection::get().add(c.get());
     };
 
     auto nudgeSelection = [&](double dt)
@@ -1792,7 +1796,7 @@ void TimelineUI::body(Sequence& seq)
         std::vector<R> rs;
         for (Clip* c : clips)
         {
-            if (!c->layer || c->layer->sequence != sp) continue;
+            if (!c->layer || c->layer->sequence != sp || c->locked || c->layer->locked) continue;
             double n = std::max(0.0, c->start() + dt);
             rs.push_back({ c->id, c->start(), n });
             c->startP->setValue((float)n);
@@ -1878,7 +1882,9 @@ void TimelineUI::body(Sequence& seq)
     {
         auto clips = Selection::get().getAs<Clip>();
         std::vector<Clip*> mine;
-        for (Clip* c : clips) if (c->layer && c->layer->sequence == sp) mine.push_back(c);
+        for (Clip* c : clips)
+            if (c->layer && c->layer->sequence == sp && !c->locked && !c->layer->locked)
+                mine.push_back(c);
         if (!mine.empty())
         {
             double anchor = 1e18;
@@ -1938,10 +1944,11 @@ void TimelineUI::body(Sequence& seq)
             {
                 uint64_t layerId = e.value("layer", (uint64_t)0);
                 ClipLayer* cl = dynamic_cast<ClipLayer*>(seq.findLayer(layerId));
+                if (cl && cl->locked) cl = nullptr; // host-managed: no pastes
                 if (!cl)
                 {
                     for (auto& l : seq.layers)
-                        if ((cl = dynamic_cast<ClipLayer*>(l.get()))) break;
+                        if (!l->locked && (cl = dynamic_cast<ClipLayer*>(l.get()))) break;
                 }
                 if (!cl) return;
                 json data = e["data"];
@@ -2150,14 +2157,14 @@ void TimelineUI::body(Sequence& seq)
             hit.layer->select(io.KeyCtrl);
             if (dbl)
             {
-                if (offerLayerRename)
+                if (offerLayerRename && !hit.layer->locked)
                 {
                     ctxLayerId = hit.layer->id;
                     snprintf(renameBuf, sizeof(renameBuf), "%s", hit.layer->niceName.c_str());
                     wantRenamePopup = true;
                 }
             }
-            else if (hit.layer->id != stickyLayerId) // the pinned lane stays put
+            else if (hit.layer->id != stickyLayerId && !hit.layer->locked) // pinned/host-managed lanes stay put
             {
                 // possible drag-reorder (engages after threshold)
                 drag = Drag::LayerReorder;
@@ -2174,13 +2181,14 @@ void TimelineUI::body(Sequence& seq)
 
         case Hit::ClipBody:
         {
+            const bool lockedClip = hit.clip->locked || (hit.layer && hit.layer->locked);
             if (dbl)
             {
                 seq.clearKeySelections();
                 hit.clip->select();
                 // host hook: open/edit what the block references (e.g. the
                 // effect graph in the app's node editor)
-                if (clipDoubleClicked) clipDoubleClicked(*hit.clip);
+                if (clipDoubleClicked && !lockedClip) clipDoubleClicked(*hit.clip);
                 break;
             }
             // Alt + drag on an audio clip: rotate the host's 3D waveform
@@ -2204,7 +2212,7 @@ void TimelineUI::body(Sequence& seq)
                 seq.clearKeySelections();
                 if (!wasSelected) Selection::get().set(hit.clip);
             }
-            if (!hit.clip->isSelected()) break;
+            if (!hit.clip->isSelected() || lockedClip) break; // host-managed: no move
 
             drag = Drag::MoveClips;
             dragItemId = hit.clip->id;
@@ -2212,7 +2220,7 @@ void TimelineUI::body(Sequence& seq)
             dragGrabDT = xToTime(mouse.x) - hit.clip->start();
             dragClips.clear();
             for (Clip* c : Selection::get().getAs<Clip>())
-                if (c->layer && c->layer->sequence == sp)
+                if (c->layer && c->layer->sequence == sp && !c->locked && !c->layer->locked)
                     dragClips.push_back({ c->id, c->layer->id, c->start() });
             break;
         }
@@ -2221,6 +2229,7 @@ void TimelineUI::body(Sequence& seq)
         {
             if (!io.KeyCtrl) seq.clearKeySelections();
             if (!hit.clip->isSelected()) Selection::get().set(hit.clip);
+            if (hit.clip->locked || (hit.layer && hit.layer->locked)) break; // no resize
             drag = (hit.kind == Hit::ClipL) ? Drag::ResizeL : Drag::ResizeR;
             dragItemId = hit.clip->id;
             dragLayerId = hit.layer->id;
@@ -2711,6 +2720,7 @@ void TimelineUI::body(Sequence& seq)
                             int ni = seq.layerIndex(c->layer) + lDelta;
                             if (ni < 0 || ni >= (int)seq.layers.size() ||
                                 seq.layers[ni]->id == stickyLayerId || // audio lane: no effects
+                                seq.layers[ni]->locked ||              // host-managed: no drops
                                 !dynamic_cast<ClipLayer*>(seq.layers[ni].get())) { ok = false; break; }
                             // target track must have room — no overlaps
                             auto* tcl = static_cast<ClipLayer*>(seq.layers[ni].get());
@@ -3068,7 +3078,7 @@ void TimelineUI::body(Sequence& seq)
                 reorderTarget = (int)seq.layers.size();
                 for (auto& g : geoms)
                 {
-                    if (g.layer == stickyL) continue; // pinned: not a seat
+                    if (g.layer == stickyL || g.layer->locked) continue; // pinned/host-managed: not a seat
                     if (mouse.y < (g.y0 + g.y1) * 0.5f) { reorderTarget = g.index; break; }
                 }
                 break;
@@ -3086,6 +3096,7 @@ void TimelineUI::body(Sequence& seq)
                     {
                         for (auto& c : cl->clips)
                         {
+                            if (c->locked || cl->locked) continue; // host-managed
                             float x0 = timeToX(c->start()), x1 = timeToX(c->end());
                             if (x1 >= rMin.x && x0 <= rMax.x)
                                 pre.push_back(c.get());
@@ -4665,8 +4676,9 @@ void TimelineUI::body(Sequence& seq)
                 const LaneGeom* g = laneAtY(mouse.y);
                 ClipLayer* target = g ? dynamic_cast<ClipLayer*>(g->layer) : nullptr;
                 // the pinned audio lane only takes audio media — an effect
-                // dropped on it falls through to the new-layer seat below
-                if (target && target->id == stickyLayerId && mp.kind != 1)
+                // dropped on it falls through to the new-layer seat below;
+                // host-managed (locked) lanes take nothing at all
+                if (target && ((target->id == stickyLayerId && mp.kind != 1) || target->locked))
                 {
                     target = nullptr;
                     g = nullptr;
@@ -4678,7 +4690,7 @@ void TimelineUI::body(Sequence& seq)
                 if (!target && !offerClipLayers)
                     for (auto& lg : geoms)
                     {
-                        if (lg.layer->id == stickyLayerId) continue;
+                        if (lg.layer->id == stickyLayerId || lg.layer->locked) continue;
                         if (auto* cl2 = dynamic_cast<ClipLayer*>(lg.layer))
                         {
                             target = cl2;
@@ -4733,19 +4745,24 @@ void TimelineUI::body(Sequence& seq)
     if (ImGui::BeginPopup("clip_ctx"))
     {
         Clip* ctxClip = seq.findClip(ctxItemId);
+        // host-managed blocks: the whole-block operations disappear — the
+        // host owns existence and geometry; only the automation stays ours
+        const bool ctxLocked = ctxClip &&
+            (ctxClip->locked || (ctxClip->layer && ctxClip->layer->locked));
         if (ImGui::MenuItem("Split Here", nullptr, false,
-                            ctxClip && ctxTime > ctxClip->start() + 0.05 && ctxTime < ctxClip->end() - 0.05))
+                            ctxClip && !ctxLocked &&
+                            ctxTime > ctxClip->start() + 0.05 && ctxTime < ctxClip->end() - 0.05))
             splitClip(ctxClip, ctxTime);
-        if (ImGui::MenuItem("Split At Playhead"))
+        if (ImGui::MenuItem("Split At Playhead", nullptr, false, !ctxLocked))
         {
             for (Clip* c : Selection::get().getAs<Clip>())
-                if (c->layer && c->layer->sequence == sp)
+                if (c->layer && c->layer->sequence == sp && !c->locked && !c->layer->locked)
                     splitClip(c, seq.currentTime);
         }
         ImGui::Separator();
-        if (ImGui::MenuItem("Copy", "Ctrl+C")) copySelection();
-        if (ImGui::MenuItem("Duplicate", "Ctrl+D")) duplicateSelection();
-        if (ImGui::MenuItem("Delete", "Del")) deleteSelection();
+        if (ImGui::MenuItem("Copy", "Ctrl+C", false, !ctxLocked)) copySelection();
+        if (ImGui::MenuItem("Duplicate", "Ctrl+D", false, !ctxLocked)) duplicateSelection();
+        if (ImGui::MenuItem("Delete", "Del", false, !ctxLocked)) deleteSelection();
         // the effect's automation as a whole (like Copy/Duplicate/Delete
         // this acts on the selected blocks — the clicked one is selected):
         // every row is emptied for redrawing, the rows themselves stay.
@@ -4976,7 +4993,10 @@ void TimelineUI::body(Sequence& seq)
             // without visiting each row (also on the block's own menu)
             if (ImGui::MenuItem("Clear Block Automation", nullptr, false, c->hasAutomationKeys()))
                 clearClipAutomation({ c });
-            if (ImGui::MenuItem("Remove Automation"))
+            // a host-managed (locked) block's row SET is derived by the host
+            // (one row per external thing) — removing a row is meaningless,
+            // the reconciliation would recreate it next frame. Clear instead.
+            if (!c->locked && ImGui::MenuItem("Remove Automation"))
             {
                 // host-derived rows: let the app clear whatever owns the
                 // row (its reconciliation removes it) — else local removal
@@ -5046,6 +5066,7 @@ void TimelineUI::body(Sequence& seq)
         int idx = seq.layerIndex(l);
         bool en = l->enabledP->boolValue();
         if (ImGui::MenuItem("Enabled", nullptr, en)) l->enabledP->setUndoable(!en);
+        if (l->locked) return; // host-managed: mute is the only layer op
         if (offerLayerRename && ImGui::MenuItem("Rename..."))
         {
             ctxLayerId = l->id;
@@ -5078,7 +5099,7 @@ void TimelineUI::body(Sequence& seq)
     if (ImGui::BeginPopup("lane_ctx"))
     {
         Layer* l = seq.findLayer(ctxLayerId);
-        if (auto* cl = dynamic_cast<ClipLayer*>(l))
+        if (auto* cl = l && l->locked ? nullptr : dynamic_cast<ClipLayer*>(l))
         {
             if (ImGui::MenuItem("Add Clip Here"))
             {

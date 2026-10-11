@@ -228,6 +228,11 @@ public:
     // Opaque host resource URI, separate from the displayed name. Travels
     // with save/load, clipboard copies, splits and undo snapshots.
     std::string hostBinding;
+    // Host-managed block: the editor refuses to move, resize, split, copy,
+    // duplicate or delete it (and its layer refuses drops) — its EMBEDDED
+    // automation rows stay fully editable. The host owns its lifecycle and
+    // geometry. Persists with the clip.
+    bool locked = false;
 
     Parameter* startP  = nullptr; // seconds
     Parameter* lengthP = nullptr; // seconds
@@ -296,6 +301,10 @@ public:
     Sequence* sequence = nullptr;
     LType     ltype;
     float     uiHeight = 60.f;
+    // Host-managed layer: the editor refuses to reorder, rename, duplicate
+    // or delete it, it accepts no clip drops or new clips, and no clip can
+    // be dragged onto it. Mute (Enabled) stays available. Persists.
+    bool      locked = false;
 
     Parameter* colorP = nullptr;
     Parameter* enabledP = nullptr; // mute / bypass the whole layer
