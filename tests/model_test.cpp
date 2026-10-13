@@ -75,6 +75,13 @@ static void testSequenceStructure()
     seq2.load(snap);
     CHECK(seq2.layers.size() == 2);
     CHECK(seq2.findClip(cid) != nullptr);
+
+    // per-sequence audio volume (the host's Clip Editor slider)
+    CHECK(seq.volumeP && seq.volumeP->floatValue() == 1.f);
+    seq.volumeP->setValue(0.4f);
+    Sequence seq3("Seq3");
+    seq3.load(seq.save());
+    CHECK(seq3.volumeP && std::fabs(seq3.volumeP->floatValue() - 0.4f) < 1e-6);
 }
 
 static void testLockedFlags()

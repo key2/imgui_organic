@@ -473,6 +473,7 @@ public:
     Parameter* lengthP   = nullptr;
     Parameter* playModeP = nullptr; // Once / Loop / Ping-Pong
     Parameter* speedP    = nullptr;
+    Parameter* volumeP   = nullptr; // this sequence's audio playback volume (0..1)
     Parameter* bpmP      = nullptr; // musical grid
     Parameter* beatsPerBarP = nullptr;
     Parameter* lengthModeP  = nullptr; // on length change: Keep / Stretch / Stick To End

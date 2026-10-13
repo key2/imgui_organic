@@ -84,6 +84,7 @@ void AudioEngine::syncFromSequence(Sequence* seq)
         next.playing = seq->playing;
         next.speed = seq->speedP->floatValue();
         next.direction = seq->direction;
+        if (seq->volumeP) next.volume = seq->volumeP->floatValue();
         uiTime.store(seq->currentTime);
         for (auto& l : seq->layers)
         {
@@ -164,7 +165,7 @@ void AudioEngine::render(float* out, unsigned int frames, int channels, int samp
     }
 
     double dtPerFrame = (localSnap.speed * localSnap.direction * rateAdjust) / sampleRate;
-    float master = masterVolume.load();
+    float master = masterVolume.load() * localSnap.volume; // engine master × the sequence's own volume
 
     for (unsigned int f = 0; f < frames; f++)
     {

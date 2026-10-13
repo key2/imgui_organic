@@ -718,7 +718,11 @@ AudioEngine::get().shutdown();
 
 The engine mixes the sequence's enabled audio clips at the transport position
 (gain, fades, offset, media looping, speed, reversed ping-pong) and follows the
-UI clock with drift correction.
+UI clock with drift correction. Three gains stack: per-clip `Clip::gainP`, the
+sequence's own `Sequence::volumeP` (0..1, persisted with the sequence — a
+host's per-timeline volume slider) and the engine-wide `setMasterVolume`.
+`setMuted(true)` renders silence for every sequence while the transport keeps
+being tracked, so unmuting resumes in sync.
 
 ### 3.14 Curve2D (2D spatial curves)
 

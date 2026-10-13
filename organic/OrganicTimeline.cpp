@@ -1380,6 +1380,7 @@ Sequence::Sequence(const std::string& name)
     lengthP->unit = "s";
     playModeP = addEnum("Play Mode", { "Once", "Loop", "Ping-Pong" }, 1, "What happens at the end (or loop range end)");
     speedP  = addFloat("Speed", 1.f, 0.05f, 4.f, "Playback speed multiplier");
+    volumeP = addFloat("Volume", 1.f, 0.f, 1.f, "This sequence's audio playback volume");
     bpmP    = addFloat("BPM", 120.f, 20.f, 300.f, "Tempo for the musical grid (Beats ruler mode)");
     beatsPerBarP = addInt("Beats Per Bar", 4, 1, 12, "Bar length for the musical grid");
     lengthModeP  = addEnum("On Length Change", { "Keep Times", "Stretch", "Stick To End" }, 0,

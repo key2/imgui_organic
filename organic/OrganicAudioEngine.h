@@ -60,6 +60,7 @@ private:
         bool   playing = false;
         double speed = 1.0;
         int    direction = 1;
+        float  volume = 1.f; // the sequence's own volume (Sequence::volumeP)
     };
 
     std::mutex snapMutex;
